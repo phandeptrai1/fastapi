@@ -1,15 +1,13 @@
 import os
 import logging
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiocache import Cache, cached
 from aiocache.serializers import JsonSerializer
-import asyncio
-from fastapi.responses import JSONResponse
-from websockets.exceptions import WebSocketDisconnect
+from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +27,10 @@ app.add_middleware(
 # aiocache configuration
 cache = Cache(Cache.MEMORY, serializer=JsonSerializer())
 
+# Giới hạn WebSocket
+MAX_WEBSOCKETS = 50  # Giới hạn tối đa 50 kết nối đồng thời
+active_websockets = defaultdict(list)  # Theo dõi các kết nối theo contact_id
+
 # MongoDB Singleton
 class MongoDBConnection:
     _instance = None
@@ -41,13 +43,12 @@ class MongoDBConnection:
             cls._db = cls._client["chat_app"]
             cls._contacts_collection = cls._db["contacts"]
             cls._messages_collection = cls._db["messages"]
-            # Create indexes (run once during setup)
-            asyncio.get_event_loop().run_until_complete(cls._create_indexes(cls))
         return cls._instance
 
-    async def _create_indexes(self):
+    async def init_indexes(self):
         await self._contacts_collection.create_index([("id", 1)])
         await self._messages_collection.create_index([("contact_id", 1)])
+        logger.info("MongoDB indexes created")
 
     @property
     def client(self):
@@ -80,7 +81,11 @@ class UploadMessages(BaseModel):
     messages: List[Message]
     contactId: Optional[int] = None
 
-# Routes
+# Khởi tạo index khi ứng dụng bắt đầu
+@app.on_event("startup")
+async def startup_event():
+    await mongo.init_indexes()
+
 @app.get("/")
 async def home():
     return {"message": "🚀 FastAPI is running!"}
@@ -140,7 +145,6 @@ async def send_message(message: SendMessage):
                 {"$set": {"lastMessage": message.content, "timestamp": message.timestamp}}
             )
 
-        # Clear cache
         await cache.delete("get_contacts")
         if message.contactId is not None:
             await cache.delete(f"get_messages_{message.contactId}_{1}_{100}")
@@ -168,7 +172,6 @@ async def upload_messages(data: UploadMessages):
                 {"$set": {"lastMessage": last_message["content"], "timestamp": last_message["timestamp"]}}
             )
 
-        # Clear cache
         await cache.delete("get_contacts")
         if data.contactId is not None:
             await cache.delete(f"get_messages_{data.contactId}_{1}_{100}")
@@ -180,24 +183,37 @@ async def upload_messages(data: UploadMessages):
         logger.error(f"Error uploading messages: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# WebSocket for real-time messaging
+# WebSocket với giới hạn kết nối
 @app.websocket("/ws/{contact_id}")
-async def websocket_endpoint(websocket, contact_id: int):
+async def websocket_endpoint(websocket: WebSocket, contact_id: int):
+    # Kiểm tra giới hạn kết nối
+    if len(active_websockets[contact_id]) >= MAX_WEBSOCKETS:
+        await websocket.close(code=1008, reason="Too many connections")
+        return
+
     await websocket.accept()
+    active_websockets[contact_id].append(websocket)
     try:
         while True:
             data = await websocket.receive_text()
-            message = {"role": "user", "content": data, "timestamp": "now"}  # Simplified for demo
+            message = {"role": "user", "content": data, "timestamp": "now"}
             await mongo.messages_collection.update_one(
                 {"contact_id": contact_id},
                 {"$push": {"messages": message}},
                 upsert=True
             )
-            await websocket.send_text(f"Message received: {data}")
+            # Gửi lại tin nhắn cho tất cả client cùng contact_id
+            for ws in active_websockets[contact_id]:
+                await ws.send_text(f"Message received: {data}")
     except WebSocketDisconnect:
+        active_websockets[contact_id].remove(websocket)
         logger.info(f"WebSocket disconnected for contact_id: {contact_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        if websocket in active_websockets[contact_id]:
+            active_websockets[contact_id].remove(websocket)
 
-# Shutdown hook
 @app.on_event("shutdown")
 async def shutdown_event():
     mongo.client.close()
