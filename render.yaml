@@ -7,4 +7,4 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port 5000
     envVars:
       - key: MONGODB_URI
-        value: your_mongodb_uri_here # Thay bằng URI của bạn sau
+        sync: false # Biến này sẽ được thêm thủ công trên Render
