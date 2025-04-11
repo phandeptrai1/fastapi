@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Chat API")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,14 +22,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache setup
 cache = Cache(Cache.MEMORY, serializer=JsonSerializer())
 
-# WebSocket limit
 MAX_WEBSOCKETS = 50
 active_websockets = defaultdict(list)
 
-# MongoDB Singleton
 class MongoDBConnection:
     _instance = None
 
@@ -60,7 +56,6 @@ class MongoDBConnection:
 
 mongo = MongoDBConnection()
 
-# Models
 class Message(BaseModel):
     role: str = Field(..., regex="^(user|assistant|system)$")
     content: str
@@ -115,22 +110,28 @@ async def get_messages(
         cursor = mongo.messages_collection.find(query, {"_id": 0, "messages": 1})
         docs = await cursor.to_list(length=None)
 
-        # Flatten messages from all docs
         all_messages = []
         for doc in docs:
             all_messages.extend(doc.get("messages", []))
 
-        # Sort messages if needed
         all_messages.sort(key=lambda x: x.get("timestamp", ""))
-
         start = (page - 1) * limit
         end = start + limit
-        paginated = all_messages[start:end]
-
-        logger.info(f"[get-messages] contact_id={contact_id} page={page} → {len(paginated)} messages")
-        return paginated
+        return all_messages[start:end]
     except Exception as e:
         logger.error(f"Error fetching messages: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/count-messages")
+async def count_messages(contact_id: Optional[int] = Query(None, alias="contactId")):
+    try:
+        query = {"contact_id": {"$exists": False}} if contact_id is None else {"contact_id": contact_id}
+        cursor = mongo.messages_collection.find(query, {"_id": 0, "messages": 1})
+        docs = await cursor.to_list(length=None)
+        total = sum(len(doc.get("messages", [])) for doc in docs)
+        return {"contactId": contact_id, "totalMessages": total}
+    except Exception as e:
+        logger.error(f"Error counting messages: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/send-message")
