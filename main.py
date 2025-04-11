@@ -12,10 +12,9 @@ from collections import defaultdict
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI app
 app = FastAPI(title="Chat API")
 
-# CORS configuration
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,12 +23,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# aiocache configuration
+# Cache setup
 cache = Cache(Cache.MEMORY, serializer=JsonSerializer())
 
-# Giới hạn WebSocket
-MAX_WEBSOCKETS = 50  # Giới hạn tối đa 50 kết nối đồng thời
-active_websockets = defaultdict(list)  # Theo dõi các kết nối theo contact_id
+# WebSocket limit
+MAX_WEBSOCKETS = 50
+active_websockets = defaultdict(list)
 
 # MongoDB Singleton
 class MongoDBConnection:
@@ -37,38 +36,31 @@ class MongoDBConnection:
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(MongoDBConnection, cls).__new__(cls)
-            MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-            cls._client = AsyncIOMotorClient(MONGO_URI, maxPoolSize=10, minPoolSize=1)
+            cls._instance = super().__new__(cls)
+            uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+            cls._client = AsyncIOMotorClient(uri, maxPoolSize=10, minPoolSize=1)
             cls._db = cls._client["chat_app"]
-            cls._contacts_collection = cls._db["contacts"]
-            cls._messages_collection = cls._db["messages"]
+            cls._contacts = cls._db["contacts"]
+            cls._messages = cls._db["messages"]
         return cls._instance
 
     async def init_indexes(self):
-        await self._contacts_collection.create_index([("id", 1)])
-        await self._messages_collection.create_index([("contact_id", 1)])
-        logger.info("MongoDB indexes created")
+        await self._contacts.create_index([("id", 1)])
+        await self._messages.create_index([("contact_id", 1)])
+        logger.info("MongoDB indexes initialized.")
 
     @property
-    def client(self):
-        return self._client
-
+    def client(self): return self._client
     @property
-    def db(self):
-        return self._db
-
+    def db(self): return self._db
     @property
-    def contacts_collection(self):
-        return self._contacts_collection
-
+    def contacts_collection(self): return self._contacts
     @property
-    def messages_collection(self):
-        return self._messages_collection
+    def messages_collection(self): return self._messages
 
 mongo = MongoDBConnection()
 
-# Pydantic Models
+# Models
 class Message(BaseModel):
     role: str = Field(..., regex="^(user|assistant|system)$")
     content: str
@@ -81,7 +73,6 @@ class UploadMessages(BaseModel):
     messages: List[Message]
     contactId: Optional[int] = None
 
-# Khởi tạo index khi ứng dụng bắt đầu
 @app.on_event("startup")
 async def startup_event():
     await mongo.init_indexes()
@@ -97,7 +88,7 @@ async def test_db():
         collections = await mongo.db.list_collection_names()
         return {"collections": collections}
     except Exception as e:
-        logger.error(f"DB error: {e}")
+        logger.error(f"DB test failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get-contacts")
@@ -109,7 +100,7 @@ async def get_contacts():
         ).to_list(None)
         return contacts
     except Exception as e:
-        logger.error(f"Error getting contacts: {e}")
+        logger.error(f"Error fetching contacts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get-messages")
@@ -121,51 +112,58 @@ async def get_messages(
 ):
     try:
         query = {"contact_id": {"$exists": False}} if contact_id is None else {"contact_id": contact_id}
-        messages_doc = await mongo.messages_collection.find_one(query, {"_id": 0, "messages": 1})
-        messages = messages_doc.get("messages", []) if messages_doc else []
+        cursor = mongo.messages_collection.find(query, {"_id": 0, "messages": 1})
+        docs = await cursor.to_list(length=None)
+
+        # Flatten messages from all docs
+        all_messages = []
+        for doc in docs:
+            all_messages.extend(doc.get("messages", []))
+
+        # Sort messages if needed
+        all_messages.sort(key=lambda x: x.get("timestamp", ""))
+
         start = (page - 1) * limit
         end = start + limit
-        paginated_messages = messages[start:end]
-        return paginated_messages
+        paginated = all_messages[start:end]
+
+        logger.info(f"[get-messages] contact_id={contact_id} page={page} → {len(paginated)} messages")
+        return paginated
     except Exception as e:
-        logger.error(f"Error getting messages: {e}")
+        logger.error(f"Error fetching messages: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/send-message")
 async def send_message(message: SendMessage):
     try:
-        query = {"contact_id": message.contactId} if message.contactId is not None else {"contact_id": {"$exists": False}}
-        await mongo.messages_collection.update_one(
-            query, {"$push": {"messages": message.dict()}}, upsert=True
-        )
-        
-        if message.contactId is not None:
+        query = {"contact_id": message.contactId} if message.contactId else {"contact_id": {"$exists": False}}
+        await mongo.messages_collection.update_one(query, {"$push": {"messages": message.dict()}}, upsert=True)
+
+        if message.contactId:
             await mongo.contacts_collection.update_one(
                 {"id": message.contactId},
                 {"$set": {"lastMessage": message.content, "timestamp": message.timestamp}}
             )
 
         await cache.delete("get_contacts")
-        if message.contactId is not None:
+        if message.contactId:
             await cache.delete(f"get_messages_{message.contactId}_{1}_{100}")
         else:
             await cache.delete("get_messages_none_1_100")
 
-        return {"message": "Message sent successfully!"}
+        return {"message": "Message sent successfully"}
     except Exception as e:
-        logger.error(f"Error sending message: {e}")
+        logger.error(f"Send message error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/upload-messages")
 async def upload_messages(data: UploadMessages):
     try:
         messages = [msg.dict() for msg in data.messages]
-        query = {"contact_id": data.contactId} if data.contactId is not None else {"contact_id": {"$exists": False}}
-        await mongo.messages_collection.update_one(
-            query, {"$push": {"messages": {"$each": messages}}}, upsert=True
-        )
+        query = {"contact_id": data.contactId} if data.contactId else {"contact_id": {"$exists": False}}
+        await mongo.messages_collection.update_one(query, {"$push": {"messages": {"$each": messages}}}, upsert=True)
 
-        if data.contactId is not None and messages:
+        if data.contactId and messages:
             last_message = messages[-1]
             await mongo.contacts_collection.update_one(
                 {"id": data.contactId},
@@ -173,26 +171,25 @@ async def upload_messages(data: UploadMessages):
             )
 
         await cache.delete("get_contacts")
-        if data.contactId is not None:
+        if data.contactId:
             await cache.delete(f"get_messages_{data.contactId}_{1}_{100}")
         else:
             await cache.delete("get_messages_none_1_100")
 
-        return {"message": f"Uploaded {len(messages)} messages successfully!"}
+        return {"message": f"Uploaded {len(messages)} messages"}
     except Exception as e:
-        logger.error(f"Error uploading messages: {e}")
+        logger.error(f"Upload error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# WebSocket với giới hạn kết nối
 @app.websocket("/ws/{contact_id}")
 async def websocket_endpoint(websocket: WebSocket, contact_id: int):
-    # Kiểm tra giới hạn kết nối
     if len(active_websockets[contact_id]) >= MAX_WEBSOCKETS:
         await websocket.close(code=1008, reason="Too many connections")
         return
 
     await websocket.accept()
     active_websockets[contact_id].append(websocket)
+
     try:
         while True:
             data = await websocket.receive_text()
@@ -202,12 +199,11 @@ async def websocket_endpoint(websocket: WebSocket, contact_id: int):
                 {"$push": {"messages": message}},
                 upsert=True
             )
-            # Gửi lại tin nhắn cho tất cả client cùng contact_id
             for ws in active_websockets[contact_id]:
                 await ws.send_text(f"Message received: {data}")
     except WebSocketDisconnect:
         active_websockets[contact_id].remove(websocket)
-        logger.info(f"WebSocket disconnected for contact_id: {contact_id}")
+        logger.info(f"WebSocket disconnected: contact_id={contact_id}")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
