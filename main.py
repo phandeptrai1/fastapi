@@ -5,7 +5,7 @@ from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from aiocache import Cache, cached
@@ -71,6 +71,16 @@ class Message(BaseModel):
     role: str = Field(..., regex="^(user|assistant|system)$")
     content: str
     timestamp: datetime
+
+    @validator("timestamp", pre=True)
+    def parse_custom_timestamp(cls, value):
+        if isinstance(value, datetime):
+            return value
+        try:
+            dt = datetime.strptime(value, "%H:%M %d/%m")
+            return dt.replace(year=datetime.utcnow().year)
+        except ValueError:
+            raise ValueError("timestamp phải có định dạng 'HH:mm dd/MM'")
 
 class SendMessage(Message):
     contactId: Optional[int] = None
