@@ -34,8 +34,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Redis setup for cache and rate limit
-redis_url = "redis://default:w33bb9sEUPAu0QTP6BmxmDVEr7dovvAI@redis-12093.c282.east-us-mz.azure.redns.redis-cloud.com:12093"
+# Redis setup for cache and rate limit (from environment)
+redis_url = os.getenv("REDIS_URL")
 redis = aioredis.from_url(redis_url)
 
 limiter = Limiter(
