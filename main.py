@@ -96,7 +96,8 @@ async def startup_event():
 
 @app.get("/")
 async def home():
-    return {"message": "\ud83d\ude80 Pro Chat API is running!"}
+    return {"message": "🚀 Pro Chat API is running!"}
+
 
 @app.get("/test-db")
 async def test_db():
