@@ -6,9 +6,9 @@ pydantic==1.10.7
 uvicorn==0.21.1
 websockets==10.4
 
-# Redis + rate-limit support
-redis>=4.5.5
+# Redis + rate-limit support (phải dùng bản redis cũ để hợp slowapi)
+redis==3.5.3
 slowapi==0.1.5
 
-# Load .env files (useful for local dev)
+# Load .env files (hữu ích khi dev local)
 python-dotenv>=0.21.0
