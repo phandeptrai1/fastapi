@@ -1,7 +1,14 @@
 fastapi==0.95.1
-motor>=3.3.0  # Phiên bản mới hơn
-pymongo>=4.0  # Phiên bản mới nhất của pymongo
+motor>=3.3.0
+pymongo>=4.0
 aiocache==0.12.0
 pydantic==1.10.7
 uvicorn==0.21.1
 websockets==10.4
+
+# Redis + rate-limit support
+redis>=4.5.5
+slowapi==0.1.5
+
+# Load .env files (useful for local dev)
+python-dotenv>=0.21.0
