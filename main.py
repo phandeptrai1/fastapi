@@ -72,6 +72,13 @@ class Message(BaseModel):
     content: str
     timestamp: datetime
 
+    def to_dict(self):
+        return {
+            "role": self.role,
+            "content": self.content,
+            "timestamp": self.timestamp.isoformat()
+        }
+
 class SendMessage(Message):
     contactId: Optional[int] = None
 
@@ -86,7 +93,7 @@ async def startup_event():
 
 @app.get("/")
 async def home():
-    return {"message": "\ud83d\ude80 Pro Chat API is running!"}
+    return {"message": "🚀 Pro Chat API is running!"}
 
 @app.get("/test-db")
 async def test_db():
@@ -121,16 +128,21 @@ async def count_messages(contactId: Optional[int] = Query(None)):
 @app.post("/send-message")
 async def send_message(message: SendMessage):
     query = {"contact_id": message.contactId} if message.contactId else {"contact_id": {"$exists": False}}
-    await mongo.messages_collection.update_one(query, {"$push": {"messages": message.dict()}}, upsert=True)
+    await mongo.messages_collection.update_one(query, {"$push": {"messages": message.to_dict()}}, upsert=True)
     if message.contactId:
-        await mongo.contacts_collection.update_one({"id": message.contactId}, {"$set": {"lastMessage": message.content, "timestamp": message.timestamp}})
+        await mongo.contacts_collection.update_one(
+            {"id": message.contactId},
+            {"$set": {"lastMessage": message.content, "timestamp": message.timestamp.isoformat()}}
+        )
     await cache.delete("get_messages")
     return {"message": "Message sent"}
 
 @app.post("/upload-messages")
 async def upload_messages(data: UploadMessages):
     query = {"contact_id": data.contactId} if data.contactId else {"contact_id": {"$exists": False}}
-    await mongo.messages_collection.update_one(query, {"$push": {"messages": {"$each": [msg.dict() for msg in data.messages]}}}, upsert=True)
+    await mongo.messages_collection.update_one(query, {
+        "$push": {"messages": {"$each": [msg.to_dict() for msg in data.messages]}}
+    }, upsert=True)
     await cache.delete("get_messages")
     return {"message": f"Uploaded {len(data.messages)} messages"}
 
