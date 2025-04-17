@@ -3,14 +3,20 @@ import logging
 from typing import List, Optional
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-from aiocache import Cache, cached
+from aiocache import cached
 from aiocache.serializers import JsonSerializer
 from collections import defaultdict
+from redis import asyncio as aioredis
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi.responses import JSONResponse
+from slowapi.decorator import limiter
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -28,8 +34,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache setup
-cache = Cache(Cache.MEMORY, serializer=JsonSerializer())
+# Redis setup for cache and rate limit
+redis_url = "redis://default:w33bb9sEUPAu0QTP6BmxmDVEr7dovvAI@redis-12093.c282.east-us-mz.azure.redns.redis-cloud.com:12093"
+redis = aioredis.from_url(redis_url)
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    storage_uri=redis_url,
+    strategy="fixed-window"
+)
+app.state.limiter = limiter
+
+@app.middleware("http")
+async def add_rate_limit(request: Request, call_next):
+    response = await limiter(request, call_next)
+    return response
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"error": "Too many requests. Please slow down."}
+    )
 
 # WebSocket tracking
 MAX_WEBSOCKETS = 50
@@ -98,7 +124,6 @@ async def startup_event():
 async def home():
     return {"message": "🚀 Pro Chat API is running!"}
 
-
 @app.get("/test-db")
 async def test_db():
     try:
@@ -109,12 +134,12 @@ async def test_db():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get-contacts")
-@cached(ttl=60, cache=Cache.MEMORY)
+@cached(ttl=60, serializer=JsonSerializer(), namespace="get_contacts", cache=aioredis.Redis, endpoint=redis)
 async def get_contacts():
     return await mongo.contacts_collection.find({}, {"_id": 0}).to_list(None)
 
 @app.get("/get-messages")
-@cached(ttl=60, cache=Cache.MEMORY)
+@cached(ttl=60, serializer=JsonSerializer(), namespace="get_messages", cache=aioredis.Redis, endpoint=redis)
 async def get_messages(contactId: Optional[int] = Query(None), page: int = 1, limit: int = 100):
     query = {"contact_id": {"$exists": False}} if contactId is None else {"contact_id": contactId}
     docs = await mongo.messages_collection.find(query).to_list(None)
@@ -130,19 +155,20 @@ async def count_messages(contactId: Optional[int] = Query(None)):
     return {"contactId": contactId, "totalMessages": sum(len(doc.get("messages", [])) for doc in docs)}
 
 @app.post("/send-message")
+@limiter.limit("5/10seconds")
 async def send_message(message: SendMessage):
     query = {"contact_id": message.contactId} if message.contactId else {"contact_id": {"$exists": False}}
     await mongo.messages_collection.update_one(query, {"$push": {"messages": message.dict()}}, upsert=True)
     if message.contactId:
         await mongo.contacts_collection.update_one({"id": message.contactId}, {"$set": {"lastMessage": message.content, "timestamp": message.timestamp}})
-    await cache.delete("get_messages")
+    await redis.delete("get_messages")
     return {"message": "Message sent"}
 
 @app.post("/upload-messages")
 async def upload_messages(data: UploadMessages):
     query = {"contact_id": data.contactId} if data.contactId else {"contact_id": {"$exists": False}}
     await mongo.messages_collection.update_one(query, {"$push": {"messages": {"$each": [msg.dict() for msg in data.messages]}}}, upsert=True)
-    await cache.delete("get_messages")
+    await redis.delete("get_messages")
     return {"message": f"Uploaded {len(data.messages)} messages"}
 
 @app.delete("/clear-messages/{document_id}")
@@ -152,7 +178,7 @@ async def clear_messages(document_id: str):
         result = await mongo.messages_collection.update_one({"_id": object_id}, {"$set": {"messages": []}})
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Document not found")
-        await cache.delete("get_messages")
+        await redis.delete("get_messages")
         return {"message": f"Cleared messages in document {document_id}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
