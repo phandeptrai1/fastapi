@@ -2,15 +2,16 @@ import os
 import logging
 import socket
 import asyncio
+import json
+import time
 from typing import List, Optional
 from datetime import datetime
+from functools import wraps
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-from aiocache import Cache, cached
-from aiocache.serializers import JsonSerializer
 from redis import asyncio as aioredis
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
@@ -51,23 +52,29 @@ try:
 except socket.gaierror as e:
     logger.warning(f"DNS resolution thất bại cho {parsed_url.hostname}: {e}. Vẫn thử kết nối Redis...")
 
-# Biến global cho Redis (khởi tạo trong startup)
+# Biến global cho Redis
 redis = None
 
-# Cache setup (bỏ ssl, dùng client_kwargs để hỗ trợ SSL)
-try:
-    cache = Cache(
-        cache_class=Cache.REDIS,
-        endpoint=parsed_url.hostname,
-        port=parsed_url.port,
-        password=parsed_url.password,
-        serializer=JsonSerializer(),
-        client_kwargs={"ssl": True}  # Cấu hình SSL cho aiocache
-    )
-    logger.info("Khởi tạo aiocache thành công")
-except Exception as e:
-    logger.error(f"Lỗi khi khởi tạo aiocache: {e}")
-    raise
+# Custom Redis cache decorator
+def redis_cached(ttl: int, namespace: str):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Tạo key từ namespace và kwargs
+            key = f"{namespace}:{json.dumps(kwargs, sort_keys=True)}"
+            # Kiểm tra cache
+            cached_result = await redis.get(key)
+            if cached_result:
+                logger.info(f"Cache hit cho key: {key}")
+                return json.loads(cached_result)
+            # Gọi hàm nếu cache miss
+            result = await func(*args, **kwargs)
+            # Lưu vào cache
+            await redis.setex(key, ttl, json.dumps(result))
+            logger.info(f"Cache set cho key: {key} với TTL {ttl}s")
+            return result
+        return wrapper
+    return decorator
 
 # WebSocket tracking
 MAX_WEBSOCKETS = 50
@@ -195,12 +202,12 @@ async def test_redis():
         raise HTTPException(status_code=500, detail=f"Redis error: {str(e)}")
 
 @app.get("/get-contacts")
-@cached(ttl=60, cache=cache, namespace="get_contacts")
+@redis_cached(ttl=60, namespace="get_contacts")
 async def get_contacts():
     return await mongo.contacts_collection.find({}, {"_id": 0}).to_list(None)
 
 @app.get("/get-messages")
-@cached(ttl=60, cache=cache, namespace="get_messages")
+@redis_cached(ttl=60, namespace="get_messages")
 async def get_messages(contactId: Optional[int] = Query(None), page: int = 1, limit: int = 100):
     query = {"contact_id": {"$exists": False}} if contactId is None else {"contact_id": contactId}
     docs = await mongo.messages_collection.find(query).to_list(None)
