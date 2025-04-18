@@ -118,13 +118,13 @@ async def test_db():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@cached(ttl=60, serializer=JsonSerializer(), namespace="get_contacts", cache="redis", endpoint=os.getenv("REDIS_URL"))
 @app.get("/get-contacts")
-@cached(ttl=60, serializer=JsonSerializer(), namespace="get_contacts", cache=aioredis.Redis, endpoint=redis)
 async def get_contacts():
     return await mongo.contacts_collection.find({}, {"_id": 0}).to_list(None)
 
+@cached(ttl=60, serializer=JsonSerializer(), namespace="get_messages", cache="redis", endpoint=os.getenv("REDIS_URL"))
 @app.get("/get-messages")
-@cached(ttl=60, serializer=JsonSerializer(), namespace="get_messages", cache=aioredis.Redis, endpoint=redis)
 async def get_messages(contactId: Optional[int] = Query(None), page: int = 1, limit: int = 100):
     query = {"contact_id": {"$exists": False}} if contactId is None else {"contact_id": contactId}
     docs = await mongo.messages_collection.find(query).to_list(None)
