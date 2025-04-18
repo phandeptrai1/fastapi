@@ -4,7 +4,6 @@ import socket
 import asyncio
 import json
 import time
-import ssl
 from typing import List, Optional
 from datetime import datetime
 from functools import wraps
@@ -143,17 +142,9 @@ async def startup_event():
         await mongo.init_indexes()
         # Khởi tạo Redis với retry
         async def init_redis_with_retry(max_attempts=3, delay=2):
-            # Tạo ssl_context để bỏ qua kiểm tra hostname nếu cần
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
             for attempt in range(1, max_attempts + 1):
                 try:
-                    redis_client = aioredis.from_url(
-                        redis_url,
-                        decode_responses=True,
-                        ssl_context=ssl_context if parsed_url.scheme != "rediss" else None
-                    )
+                    redis_client = aioredis.from_url(redis_url, decode_responses=True)
                     pong = await redis_client.ping()
                     logger.info(f"Kết nối Redis thành công: {pong}")
                     return redis_client
@@ -175,11 +166,7 @@ async def startup_event():
         except Exception as e:
             logger.warning(f"Kết nối TCP tới Redis thất bại: {e}")
         # Khởi tạo FastAPILimiter
-        redis_for_limiter = aioredis.from_url(
-            redis_url,
-            decode_responses=True,
-            ssl_context=ssl_context if parsed_url.scheme != "rediss" else None
-        )
+        redis_for_limiter = aioredis.from_url(redis_url, decode_responses=True)
         await FastAPILimiter.init(redis_for_limiter)
         logger.info("Khởi tạo FastAPILimiter thành công")
     except Exception as e:
