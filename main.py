@@ -39,20 +39,19 @@ if not redis_url:
     raise ValueError("REDIS_URL không được set")
 
 logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")  # Ẩn password trong log
+parsed_url = urlparse(redis_url)
+
+# Kiểm tra DNS resolution
 try:
-    # Kiểm tra DNS resolution
-    parsed_url = urlparse(redis_url)
     socket.gethostbyname(parsed_url.hostname)
     logger.info(f"DNS resolution thành công cho {parsed_url.hostname}")
 except socket.gaierror as e:
     logger.error(f"DNS resolution thất bại cho {parsed_url.hostname}: {e}")
     raise
 
+# Khởi tạo Redis
 try:
     redis = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
-    # Test kết nối Redis
-    pong = await redis.ping()
-    logger.info(f"Kết nối Redis thành công: {pong}")
 except Exception as e:
     logger.error(f"Lỗi khi khởi tạo aioredis: {e}")
     raise
@@ -136,6 +135,9 @@ class UploadMessages(BaseModel):
 async def startup_event():
     try:
         await mongo.init_indexes()
+        # Test Redis connection
+        pong = await redis.ping()
+        logger.info(f"Kết nối Redis thành công: {pong}")
         redis_for_limiter = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
         await FastAPILimiter.init(redis_for_limiter)
         logger.info("Khởi tạo FastAPILimiter thành công")
