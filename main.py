@@ -3,20 +3,19 @@ import logging
 import socket
 import asyncio
 import json
+from typing import List, Optional
 from datetime import datetime
 from functools import wraps
-from typing import List, Optional
-from urllib.parse import urlparse
-
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi_limiter import FastAPILimiter
-from fastapi_limiter.depends import RateLimiter
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from redis import asyncio as aioredis
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
 from collections import defaultdict
+from urllib.parse import urlparse
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -37,20 +36,23 @@ app.add_middleware(
 # Redis setup
 redis_url = os.getenv("REDIS_URL")
 if not redis_url:
-    raise ValueError("REDIS_URL is not set")
-logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")
+    logger.error("REDIS_URL không được set trong biến môi trường")
+    raise ValueError("REDIS_URL không được set")
+
+logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")  # Ẩn password trong log
 parsed_url = urlparse(redis_url)
 
-# Kiểm tra DNS
+# Kiểm tra DNS resolution
 try:
     socket.gethostbyname(parsed_url.hostname)
     logger.info(f"DNS resolved: {parsed_url.hostname}")
 except socket.gaierror as e:
-    logger.warning(f"DNS failed for {parsed_url.hostname}: {e}")
+    logger.warning(f"DNS resolution failed for {parsed_url.hostname}: {e}")
 
-# Redis instance
+# Global redis client
 redis = None
 
+# Custom Redis cache decorator
 def redis_cached(ttl: int, namespace: str):
     def decorator(func):
         @wraps(func)
@@ -58,18 +60,20 @@ def redis_cached(ttl: int, namespace: str):
             key = f"{namespace}:{json.dumps(kwargs, sort_keys=True)}"
             cached_result = await redis.get(key)
             if cached_result:
-                logger.info(f"Cache hit: {key}")
+                logger.info(f"Cache hit cho key: {key}")
                 return json.loads(cached_result)
             result = await func(*args, **kwargs)
             await redis.setex(key, ttl, json.dumps(result))
-            logger.info(f"Cache set: {key}")
+            logger.info(f"Cache set cho key: {key} với TTL {ttl}s")
             return result
         return wrapper
     return decorator
 
+# WebSocket tracking
 MAX_WEBSOCKETS = 50
 active_websockets = defaultdict(list)
 
+# MongoDB Singleton
 class MongoDBConnection:
     _instance = None
 
@@ -78,7 +82,7 @@ class MongoDBConnection:
             cls._instance = super().__new__(cls)
             uri = os.getenv("MONGODB_URI")
             if not uri:
-                raise ValueError("MONGODB_URI is not set")
+                raise ValueError("MONGODB_URI không được set")
             cls._client = AsyncIOMotorClient(uri)
             cls._db = cls._client["chat_app"]
             cls._contacts = cls._db["contacts"]
@@ -100,6 +104,7 @@ class MongoDBConnection:
 
 mongo = MongoDBConnection()
 
+# Pydantic Models
 class Message(BaseModel):
     role: str = Field(..., regex="^(user|assistant|system)$")
     content: str
@@ -113,7 +118,7 @@ class Message(BaseModel):
             dt = datetime.strptime(value, "%H:%M %d/%m")
             return dt.replace(year=datetime.utcnow().year)
         except ValueError:
-            raise ValueError("timestamp phải định dạng 'HH:mm dd/MM'")
+            raise ValueError("timestamp phải có định dạng 'HH:mm dd/MM'")
 
 class SendMessage(Message):
     contactId: Optional[int] = None
@@ -122,16 +127,16 @@ class UploadMessages(BaseModel):
     messages: List[Message]
     contactId: Optional[int] = None
 
+# App startup
 @app.on_event("startup")
 async def startup_event():
     global redis
     await mongo.init_indexes()
     try:
-        redis = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
+        redis = aioredis.from_url(redis_url, decode_responses=True)
         await redis.ping()
-        logger.info("Redis connected successfully")
         await FastAPILimiter.init(redis)
-        logger.info("FastAPILimiter initialized")
+        logger.info("Redis và FastAPILimiter đã khởi tạo thành công")
     except Exception as e:
         logger.error(f"Redis init failed: {e}")
         raise
@@ -141,7 +146,7 @@ async def shutdown_event():
     mongo.client.close()
     if redis:
         await redis.close()
-    logger.info("Shutdown complete")
+    logger.info("MongoDB và Redis connections đã được đóng")
 
 @app.get("/")
 async def home():
@@ -151,7 +156,8 @@ async def home():
 async def test_db():
     try:
         await mongo.client.admin.command("ping")
-        return {"status": "MongoDB OK"}
+        collections = await mongo.db.list_collection_names()
+        return {"collections": collections}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -159,9 +165,9 @@ async def test_db():
 async def test_redis():
     try:
         pong = await redis.ping()
-        return {"redis": pong}
+        return {"message": "Redis connection OK", "response": pong}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Redis error: {e}")
+        raise HTTPException(status_code=500, detail=f"Redis error: {str(e)}")
 
 @app.get("/get-contacts")
 @redis_cached(ttl=60, namespace="get_contacts")
@@ -222,8 +228,16 @@ async def websocket_endpoint(websocket: WebSocket, contact_id: int):
     try:
         while True:
             data = await websocket.receive_text()
-            message = {"role": "user", "content": data, "timestamp": datetime.utcnow().isoformat()}
-            await mongo.messages_collection.update_one({"contact_id": contact_id}, {"$push": {"messages": message}}, upsert=True)
+            message = {
+                "role": "user",
+                "content": data,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            await mongo.messages_collection.update_one(
+                {"contact_id": contact_id},
+                {"$push": {"messages": message}},
+                upsert=True
+            )
             for ws in active_websockets[contact_id]:
                 await ws.send_json({"contact_id": contact_id, "message": message})
     except WebSocketDisconnect:
