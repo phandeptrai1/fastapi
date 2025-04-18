@@ -15,6 +15,7 @@ from redis import asyncio as aioredis
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
 from fastapi.responses import JSONResponse
+from aiocache import Cache
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -118,13 +119,13 @@ async def test_db():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@cached(ttl=60, serializer=JsonSerializer(), namespace="get_contacts", cache="redis", endpoint=os.getenv("REDIS_URL"))
 @app.get("/get-contacts")
+@cached(ttl=60, serializer=JsonSerializer(), namespace="get_contacts", cache="redis", endpoint=redis_url)
 async def get_contacts():
     return await mongo.contacts_collection.find({}, {"_id": 0}).to_list(None)
 
-@cached(ttl=60, serializer=JsonSerializer(), namespace="get_messages", cache="redis", endpoint=os.getenv("REDIS_URL"))
 @app.get("/get-messages")
+@cached(ttl=60, serializer=JsonSerializer(), namespace="get_messages", cache="redis", endpoint=redis_url)
 async def get_messages(contactId: Optional[int] = Query(None), page: int = 1, limit: int = 100):
     query = {"contact_id": {"$exists": False}} if contactId is None else {"contact_id": contactId}
     docs = await mongo.messages_collection.find(query).to_list(None)
