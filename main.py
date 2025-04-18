@@ -1,6 +1,8 @@
 import os
 import logging
 import socket
+import asyncio
+import time
 from typing import List, Optional
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends
@@ -32,7 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Redis setup
+# Redis setup with retry logic
 redis_url = os.getenv("REDIS_URL")
 if not redis_url:
     logger.error("REDIS_URL không được set trong biến môi trường")
@@ -42,28 +44,45 @@ logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}") 
 parsed_url = urlparse(redis_url)
 
 # Kiểm tra DNS resolution
+dns_resolved = False
 try:
     socket.gethostbyname(parsed_url.hostname)
     logger.info(f"DNS resolution thành công cho {parsed_url.hostname}")
+    dns_resolved = True
 except socket.gaierror as e:
-    logger.error(f"DNS resolution thất bại cho {parsed_url.hostname}: {e}")
-    raise
+    logger.warning(f"DNS resolution thất bại cho {parsed_url.hostname}: {e}. Vẫn thử kết nối Redis...")
 
-# Khởi tạo Redis
+# Khởi tạo Redis với retry
+async def init_redis_with_retry(max_attempts=3, delay=2):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            redis_client = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
+            pong = await redis_client.ping()
+            logger.info(f"Kết nối Redis thành công: {pong}")
+            return redis_client
+        except Exception as e:
+            logger.error(f"Thử kết nối Redis lần {attempt}/{max_attempts} thất bại: {e}")
+            if attempt < max_attempts:
+                logger.info(f"Thử lại sau {delay} giây...")
+                time.sleep(delay)
+            else:
+                raise Exception(f"Không thể kết nối Redis sau {max_attempts} lần thử: {e}")
+
+redis = None
 try:
-    redis = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
+    loop = asyncio.get_event_loop()
+    redis = loop.run_until_complete(init_redis_with_retry())
 except Exception as e:
     logger.error(f"Lỗi khi khởi tạo aioredis: {e}")
     raise
 
-# Cache setup
+# Cache setup (bỏ username vì aiocache 0.12.0 không hỗ trợ)
 try:
     cache = Cache(
         cache_class=Cache.REDIS,
         endpoint=parsed_url.hostname,
         port=parsed_url.port,
         password=parsed_url.password,
-        username=parsed_url.username,
         ssl=True,
         serializer=JsonSerializer()
     )
@@ -135,9 +154,15 @@ class UploadMessages(BaseModel):
 async def startup_event():
     try:
         await mongo.init_indexes()
-        # Test Redis connection
-        pong = await redis.ping()
-        logger.info(f"Kết nối Redis thành công: {pong}")
+        # Test TCP connection
+        try:
+            reader, writer = await asyncio.open_connection(parsed_url.hostname, parsed_url.port, ssl=True)
+            writer.close()
+            await writer.wait_closed()
+            logger.info("Kết nối TCP tới Redis thành công")
+        except Exception as e:
+            logger.warning(f"Kết nối TCP tới Redis thất bại: {e}")
+        # Khởi tạo FastAPILimiter
         redis_for_limiter = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
         await FastAPILimiter.init(redis_for_limiter)
         logger.info("Khởi tạo FastAPILimiter thành công")
