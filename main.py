@@ -3,7 +3,7 @@ import logging
 from typing import List, Optional
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Request, status
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -12,11 +12,9 @@ from aiocache import cached
 from aiocache.serializers import JsonSerializer
 from collections import defaultdict
 from redis import asyncio as aioredis
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
 from fastapi.responses import JSONResponse
-from slowapi.decorator import limiter
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -34,28 +32,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Redis setup for cache and rate limit (from environment)
+# Redis setup
 redis_url = os.getenv("REDIS_URL")
 redis = aioredis.from_url(redis_url)
-
-limiter = Limiter(
-    key_func=get_remote_address,
-    storage_uri=redis_url,
-    strategy="fixed-window"
-)
-app.state.limiter = limiter
-
-@app.middleware("http")
-async def add_rate_limit(request: Request, call_next):
-    response = await limiter(request, call_next)
-    return response
-
-@app.exception_handler(RateLimitExceeded)
-async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return JSONResponse(
-        status_code=429,
-        content={"error": "Too many requests. Please slow down."}
-    )
 
 # WebSocket tracking
 MAX_WEBSOCKETS = 50
@@ -119,6 +98,12 @@ class UploadMessages(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     await mongo.init_indexes()
+    await FastAPILimiter.init(redis)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    mongo.client.close()
+    logger.info("MongoDB connection closed")
 
 @app.get("/")
 async def home():
@@ -154,8 +139,7 @@ async def count_messages(contactId: Optional[int] = Query(None)):
     docs = await mongo.messages_collection.find(query).to_list(None)
     return {"contactId": contactId, "totalMessages": sum(len(doc.get("messages", [])) for doc in docs)}
 
-@app.post("/send-message")
-@limiter.limit("5/10seconds")
+@app.post("/send-message", dependencies=[Depends(RateLimiter(times=5, seconds=10))])
 async def send_message(message: SendMessage):
     query = {"contact_id": message.contactId} if message.contactId else {"contact_id": {"$exists": False}}
     await mongo.messages_collection.update_one(query, {"$push": {"messages": message.dict()}}, upsert=True)
@@ -210,11 +194,6 @@ async def websocket_endpoint(websocket: WebSocket, contact_id: int):
     except Exception as e:
         active_websockets[contact_id].remove(websocket)
         logger.error(f"WebSocket error: {e}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    mongo.client.close()
-    logger.info("MongoDB connection closed")
 
 if __name__ == "__main__":
     import uvicorn
