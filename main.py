@@ -2,20 +2,18 @@ import os
 import logging
 from typing import List, Optional
 from datetime import datetime
-
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-from aiocache import cached
+from aiocache import Cache, cached
 from aiocache.serializers import JsonSerializer
-from aiocache.backends.redis import RedisCache
-from collections import defaultdict
 from redis import asyncio as aioredis
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
-from fastapi.responses import JSONResponse
+from collections import defaultdict
+from urllib.parse import urlparse
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -35,7 +33,32 @@ app.add_middleware(
 
 # Redis setup
 redis_url = os.getenv("REDIS_URL")
-redis = aioredis.from_url(redis_url)
+if not redis_url:
+    logger.error("REDIS_URL không được set trong biến môi trường")
+    raise ValueError("REDIS_URL không được set")
+
+logger.info(f"Đang kết nối tới Redis tại: {redis_url}")
+try:
+    redis = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
+except Exception as e:
+    logger.error(f"Lỗi khi khởi tạo aioredis: {e}")
+    raise
+
+# Cache setup
+try:
+    parsed_url = urlparse(redis_url)
+    cache = Cache(
+        cache_class=Cache.REDIS,
+        endpoint=parsed_url.hostname,
+        port=parsed_url.port,
+        password=parsed_url.password,
+        username=parsed_url.username,
+        ssl=True,
+        serializer=JsonSerializer()
+    )
+except Exception as e:
+    logger.error(f"Lỗi khi khởi tạo aiocache: {e}")
+    raise
 
 # WebSocket tracking
 MAX_WEBSOCKETS = 50
@@ -50,7 +73,7 @@ class MongoDBConnection:
             cls._instance = super().__new__(cls)
             uri = os.getenv("MONGODB_URI")
             if not uri:
-                raise ValueError("MONGODB_URI environment variable not set")
+                raise ValueError("MONGODB_URI không được set")
             cls._client = AsyncIOMotorClient(uri)
             cls._db = cls._client["chat_app"]
             cls._contacts = cls._db["contacts"]
@@ -98,8 +121,14 @@ class UploadMessages(BaseModel):
 # App startup
 @app.on_event("startup")
 async def startup_event():
-    await mongo.init_indexes()
-    await FastAPILimiter.init(redis)
+    try:
+        await mongo.initIndexes()
+        redis_for_limiter = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
+        await FastAPILimiter.init(redis_for_limiter)
+        logger.info("Khởi tạo FastAPILimiter thành công")
+    except Exception as e:
+        logger.error(f"Lỗi khi khởi tạo startup event: {e}")
+        raise
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -120,12 +149,12 @@ async def test_db():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get-contacts")
-@cached(ttl=60, serializer=JsonSerializer(), namespace="get_contacts", cache=RedisCache, endpoint=redis_url)
+@cached(ttl=60, cache=cache, namespace="get_contacts")
 async def get_contacts():
     return await mongo.contacts_collection.find({}, {"_id": 0}).to_list(None)
 
 @app.get("/get-messages")
-@cached(ttl=60, serializer=JsonSerializer(), namespace="get_messages", cache=RedisCache, endpoint=redis_url)
+@cached(ttl=60, cache=cache, namespace="get_messages")
 async def get_messages(contactId: Optional[int] = Query(None), page: int = 1, limit: int = 100):
     query = {"contact_id": {"$exists": False}} if contactId is None else {"contact_id": contactId}
     docs = await mongo.messages_collection.find(query).to_list(None)
