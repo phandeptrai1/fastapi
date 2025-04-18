@@ -1,8 +1,9 @@
 import os
 import logging
+import socket
 from typing import List, Optional
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Request, Depends
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -37,16 +38,27 @@ if not redis_url:
     logger.error("REDIS_URL không được set trong biến môi trường")
     raise ValueError("REDIS_URL không được set")
 
-logger.info(f"Đang kết nối tới Redis tại: {redis_url}")
+logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")  # Ẩn password trong log
+try:
+    # Kiểm tra DNS resolution
+    parsed_url = urlparse(redis_url)
+    socket.gethostbyname(parsed_url.hostname)
+    logger.info(f"DNS resolution thành công cho {parsed_url.hostname}")
+except socket.gaierror as e:
+    logger.error(f"DNS resolution thất bại cho {parsed_url.hostname}: {e}")
+    raise
+
 try:
     redis = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
+    # Test kết nối Redis
+    pong = await redis.ping()
+    logger.info(f"Kết nối Redis thành công: {pong}")
 except Exception as e:
     logger.error(f"Lỗi khi khởi tạo aioredis: {e}")
     raise
 
 # Cache setup
 try:
-    parsed_url = urlparse(redis_url)
     cache = Cache(
         cache_class=Cache.REDIS,
         endpoint=parsed_url.hostname,
@@ -56,6 +68,7 @@ try:
         ssl=True,
         serializer=JsonSerializer()
     )
+    logger.info("Khởi tạo aiocache thành công")
 except Exception as e:
     logger.error(f"Lỗi khi khởi tạo aiocache: {e}")
     raise
@@ -122,7 +135,7 @@ class UploadMessages(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     try:
-        await mongo.initIndexes()
+        await mongo.init_indexes()
         redis_for_limiter = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
         await FastAPILimiter.init(redis_for_limiter)
         logger.info("Khởi tạo FastAPILimiter thành công")
@@ -133,7 +146,8 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     mongo.client.close()
-    logger.info("MongoDB connection closed")
+    await redis.close()
+    logger.info("Đóng kết nối MongoDB và Redis")
 
 @app.get("/")
 async def home():
@@ -147,6 +161,14 @@ async def test_db():
         return {"collections": collections}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/test-redis")
+async def test_redis():
+    try:
+        pong = await redis.ping()
+        return {"message": "Redis connection OK", "response": pong}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Redis error: {str(e)}")
 
 @app.get("/get-contacts")
 @cached(ttl=60, cache=cache, namespace="get_contacts")
