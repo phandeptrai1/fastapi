@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-from redis import asyncio as aioredis
+from redis.asyncio import Redis
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
 from collections import defaultdict
@@ -41,19 +41,15 @@ if not redis_url:
     logger.error("REDIS_URL không được set trong biến môi trường")
     raise ValueError("REDIS_URL không được set")
 
-logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")  # Ẩn password trong log
+logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")
 parsed_url = urlparse(redis_url)
 
-# Kiểm tra DNS resolution
-dns_resolved = False
 try:
     socket.gethostbyname(parsed_url.hostname)
     logger.info(f"DNS resolution thành công cho {parsed_url.hostname}")
-    dns_resolved = True
 except socket.gaierror as e:
     logger.warning(f"DNS resolution thất bại cho {parsed_url.hostname}: {e}. Vẫn thử kết nối Redis...")
 
-# Biến global cho Redis
 redis = None
 
 # Custom Redis cache decorator
@@ -61,27 +57,21 @@ def redis_cached(ttl: int, namespace: str):
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            # Tạo key từ namespace và kwargs
             key = f"{namespace}:{json.dumps(kwargs, sort_keys=True)}"
-            # Kiểm tra cache
             cached_result = await redis.get(key)
             if cached_result:
                 logger.info(f"Cache hit cho key: {key}")
                 return json.loads(cached_result)
-            # Gọi hàm nếu cache miss
             result = await func(*args, **kwargs)
-            # Lưu vào cache
             await redis.setex(key, ttl, json.dumps(result))
             logger.info(f"Cache set cho key: {key} với TTL {ttl}s")
             return result
         return wrapper
     return decorator
 
-# WebSocket tracking
 MAX_WEBSOCKETS = 50
 active_websockets = defaultdict(list)
 
-# MongoDB Singleton
 class MongoDBConnection:
     _instance = None
 
@@ -112,7 +102,6 @@ class MongoDBConnection:
 
 mongo = MongoDBConnection()
 
-# Pydantic Models
 class Message(BaseModel):
     role: str = Field(..., regex="^(user|assistant|system)$")
     content: str
@@ -135,58 +124,23 @@ class UploadMessages(BaseModel):
     messages: List[Message]
     contactId: Optional[int] = None
 
-# App startup
 @app.on_event("startup")
 async def startup_event():
     global redis
     try:
         await mongo.init_indexes()
-        # Khởi tạo Redis với retry
-        async def init_redis_with_retry(max_attempts=3, delay=2):
-            # Tạo ssl_context để bỏ qua kiểm tra hostname và chứng chỉ
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2  # Đảm bảo TLS 1.2+
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    redis_client = aioredis.from_url(
-                        redis_url,
-                        decode_responses=True,
-                        connection_kwargs={"ssl": ssl_context}
-                    )
-                    pong = await redis_client.ping()
-                    logger.info(f"Kết nối Redis thành công: {pong}")
-                    return redis_client
-                except Exception as e:
-                    logger.error(f"Thử kết nối Redis lần {attempt}/{max_attempts} thất bại: {e}")
-                    if attempt < max_attempts:
-                        logger.info(f"Thử lại sau {delay} giây...")
-                        await asyncio.sleep(delay)
-                    else:
-                        raise Exception(f"Không thể kết nối Redis sau {max_attempts} lần thử: {e}")
-        
-        redis = await init_redis_with_retry()
-        # Test TCP connection
-        try:
-            reader, writer = await asyncio.open_connection(parsed_url.hostname, parsed_url.port, ssl=True)
-            writer.close()
-            await writer.wait_closed()
-            logger.info("Kết nối TCP tới Redis thành công")
-        except Exception as e:
-            logger.warning(f"Kết nối TCP tới Redis thất bại: {e}")
-        # Khởi tạo FastAPILimiter
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+        ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-        redis_for_limiter = aioredis.from_url(
-            redis_url,
-            decode_responses=True,
-            connection_kwargs={"ssl": ssl_context}
-        )
-        await FastAPILimiter.init(redis_for_limiter)
+
+        redis = Redis.from_url(redis_url, decode_responses=True, ssl=True, ssl_cert_reqs=None, ssl_ca_certs=None)
+        pong = await redis.ping()
+        logger.info(f"Kết nối Redis thành công: {pong}")
+
+        await FastAPILimiter.init(redis)
         logger.info("Khởi tạo FastAPILimiter thành công")
+
     except Exception as e:
         logger.error(f"Lỗi khi khởi tạo startup event: {e}")
         raise
