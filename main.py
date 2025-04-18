@@ -34,7 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Redis setup with retry logic
+# Redis setup
 redis_url = os.getenv("REDIS_URL")
 if not redis_url:
     logger.error("REDIS_URL không được set trong biến môi trường")
@@ -52,31 +52,10 @@ try:
 except socket.gaierror as e:
     logger.warning(f"DNS resolution thất bại cho {parsed_url.hostname}: {e}. Vẫn thử kết nối Redis...")
 
-# Khởi tạo Redis với retry
-async def init_redis_with_retry(max_attempts=3, delay=2):
-    for attempt in range(1, max_attempts + 1):
-        try:
-            redis_client = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
-            pong = await redis_client.ping()
-            logger.info(f"Kết nối Redis thành công: {pong}")
-            return redis_client
-        except Exception as e:
-            logger.error(f"Thử kết nối Redis lần {attempt}/{max_attempts} thất bại: {e}")
-            if attempt < max_attempts:
-                logger.info(f"Thử lại sau {delay} giây...")
-                time.sleep(delay)
-            else:
-                raise Exception(f"Không thể kết nối Redis sau {max_attempts} lần thử: {e}")
-
+# Biến global cho Redis (khởi tạo trong startup)
 redis = None
-try:
-    loop = asyncio.get_event_loop()
-    redis = loop.run_until_complete(init_redis_with_retry())
-except Exception as e:
-    logger.error(f"Lỗi khi khởi tạo aioredis: {e}")
-    raise
 
-# Cache setup (bỏ username vì aiocache 0.12.0 không hỗ trợ)
+# Cache setup (không có username vì aiocache 0.12.0 không hỗ trợ)
 try:
     cache = Cache(
         cache_class=Cache.REDIS,
@@ -152,8 +131,26 @@ class UploadMessages(BaseModel):
 # App startup
 @app.on_event("startup")
 async def startup_event():
+    global redis
     try:
         await mongo.init_indexes()
+        # Khởi tạo Redis với retry
+        async def init_redis_with_retry(max_attempts=3, delay=2):
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    redis_client = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
+                    pong = await redis_client.ping()
+                    logger.info(f"Kết nối Redis thành công: {pong}")
+                    return redis_client
+                except Exception as e:
+                    logger.error(f"Thử kết nối Redis lần {attempt}/{max_attempts} thất bại: {e}")
+                    if attempt < max_attempts:
+                        logger.info(f"Thử lại sau {delay} giây...")
+                        await asyncio.sleep(delay)
+                    else:
+                        raise Exception(f"Không thể kết nối Redis sau {max_attempts} lần thử: {e}")
+        
+        redis = await init_redis_with_retry()
         # Test TCP connection
         try:
             reader, writer = await asyncio.open_connection(parsed_url.hostname, parsed_url.port, ssl=True)
@@ -173,7 +170,8 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     mongo.client.close()
-    await redis.close()
+    if redis:
+        await redis.close()
     logger.info("Đóng kết nối MongoDB và Redis")
 
 @app.get("/")
