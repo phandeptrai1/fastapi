@@ -3,7 +3,6 @@ import logging
 import socket
 import asyncio
 import json
-import time
 import ssl
 from typing import List, Optional
 from datetime import datetime
@@ -13,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-from redis.asyncio import Redis
+from redis import asyncio as aioredis
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
 from collections import defaultdict
@@ -36,23 +35,20 @@ app.add_middleware(
 )
 
 # Redis setup
-redis_url = os.getenv("REDIS_URL")
-if not redis_url:
-    logger.error("REDIS_URL không được set trong biến môi trường")
-    raise ValueError("REDIS_URL không được set")
-
+redis_url = os.getenv("REDIS_URL") or "rediss://default:ymPqVFVvcpMj8bx6K4SMKHWcC8AgucRx@redis-13134.c251.east-us-mz.azure.redns.redis-cloud.com:13134"
 logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")
 parsed_url = urlparse(redis_url)
 
+# Kiểm tra DNS
 try:
     socket.gethostbyname(parsed_url.hostname)
     logger.info(f"DNS resolution thành công cho {parsed_url.hostname}")
 except socket.gaierror as e:
-    logger.warning(f"DNS resolution thất bại cho {parsed_url.hostname}: {e}. Vẫn thử kết nối Redis...")
+    logger.warning(f"DNS resolution thất bại: {e}")
 
 redis = None
 
-# Custom Redis cache decorator
+# Redis cache decorator
 def redis_cached(ttl: int, namespace: str):
     def decorator(func):
         @wraps(func)
@@ -60,21 +56,22 @@ def redis_cached(ttl: int, namespace: str):
             key = f"{namespace}:{json.dumps(kwargs, sort_keys=True)}"
             cached_result = await redis.get(key)
             if cached_result:
-                logger.info(f"Cache hit cho key: {key}")
+                logger.info(f"Cache hit: {key}")
                 return json.loads(cached_result)
             result = await func(*args, **kwargs)
             await redis.setex(key, ttl, json.dumps(result))
-            logger.info(f"Cache set cho key: {key} với TTL {ttl}s")
+            logger.info(f"Cache set: {key} TTL {ttl}s")
             return result
         return wrapper
     return decorator
 
+# WebSocket tracking
 MAX_WEBSOCKETS = 50
 active_websockets = defaultdict(list)
 
+# MongoDB Singleton
 class MongoDBConnection:
     _instance = None
-
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -129,20 +126,21 @@ async def startup_event():
     global redis
     try:
         await mongo.init_indexes()
-
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        redis = Redis.from_url(redis_url, decode_responses=True, ssl=True, ssl_cert_reqs=None, ssl_ca_certs=None)
-        pong = await redis.ping()
-        logger.info(f"Kết nối Redis thành công: {pong}")
+        redis = aioredis.from_url(
+            redis_url,
+            decode_responses=True,
+            ssl=ssl_context
+        )
 
+        await redis.ping()
+        logger.info("Kết nối Redis thành công")
         await FastAPILimiter.init(redis)
-        logger.info("Khởi tạo FastAPILimiter thành công")
-
     except Exception as e:
-        logger.error(f"Lỗi khi khởi tạo startup event: {e}")
+        logger.error(f"Lỗi khi khởi tạo Redis: {e}")
         raise
 
 @app.on_event("shutdown")
@@ -150,7 +148,6 @@ async def shutdown_event():
     mongo.client.close()
     if redis:
         await redis.close()
-    logger.info("Đóng kết nối MongoDB và Redis")
 
 @app.get("/")
 async def home():
@@ -169,9 +166,9 @@ async def test_db():
 async def test_redis():
     try:
         pong = await redis.ping()
-        return {"message": "Redis connection OK", "response": pong}
+        return {"message": "Redis OK", "response": pong}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Redis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get-contacts")
 @redis_cached(ttl=60, namespace="get_contacts")
