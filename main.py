@@ -153,7 +153,7 @@ async def startup_event():
                     redis_client = aioredis.from_url(
                         redis_url,
                         decode_responses=True,
-                        ssl_context=ssl_context if parsed_url.scheme != "rediss" else None
+                        ssl_context=ssl_context
                     )
                     pong = await redis_client.ping()
                     logger.info(f"Kết nối Redis thành công: {pong}")
@@ -183,7 +183,7 @@ async def startup_event():
         redis_for_limiter = aioredis.from_url(
             redis_url,
             decode_responses=True,
-            ssl_context=ssl_context if parsed_url.scheme != "rediss" else None
+            ssl_context=ssl_context
         )
         await FastAPILimiter.init(redis_for_limiter)
         logger.info("Khởi tạo FastAPILimiter thành công")
