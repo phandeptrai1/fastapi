@@ -2,7 +2,6 @@ import os
 import logging
 import socket
 import asyncio
-import time
 from typing import List, Optional
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends
@@ -55,15 +54,15 @@ except socket.gaierror as e:
 # Biến global cho Redis (khởi tạo trong startup)
 redis = None
 
-# Cache setup (không có username vì aiocache 0.12.0 không hỗ trợ)
+# Cache setup (bỏ ssl, dùng client_kwargs để hỗ trợ SSL)
 try:
     cache = Cache(
         cache_class=Cache.REDIS,
         endpoint=parsed_url.hostname,
         port=parsed_url.port,
         password=parsed_url.password,
-        ssl=True,
-        serializer=JsonSerializer()
+        serializer=JsonSerializer(),
+        client_kwargs={"ssl": True}  # Cấu hình SSL cho aiocache
     )
     logger.info("Khởi tạo aiocache thành công")
 except Exception as e:
