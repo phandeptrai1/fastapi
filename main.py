@@ -144,7 +144,7 @@ async def startup_event():
         async def init_redis_with_retry(max_attempts=3, delay=2):
             for attempt in range(1, max_attempts + 1):
                 try:
-                    redis_client = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
+                    redis_client = aioredis.from_url(redis_url, decode_responses=True)
                     pong = await redis_client.ping()
                     logger.info(f"Kết nối Redis thành công: {pong}")
                     return redis_client
@@ -166,7 +166,7 @@ async def startup_event():
         except Exception as e:
             logger.warning(f"Kết nối TCP tới Redis thất bại: {e}")
         # Khởi tạo FastAPILimiter
-        redis_for_limiter = aioredis.from_url(redis_url, decode_responses=True, ssl=True)
+        redis_for_limiter = aioredis.from_url(redis_url, decode_responses=True)
         await FastAPILimiter.init(redis_for_limiter)
         logger.info("Khởi tạo FastAPILimiter thành công")
     except Exception as e:
