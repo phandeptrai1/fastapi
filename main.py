@@ -17,6 +17,13 @@ from fastapi_limiter.depends import RateLimiter
 from collections import defaultdict
 from urllib.parse import urlparse
 
+# Hỗ trợ serialize datetime trong JSON
+class EnhancedJSONEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, datetime):
+            return o.isoformat()
+        return super().default(o)
+
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("chat_api")
@@ -39,7 +46,7 @@ if not redis_url:
     logger.error("REDIS_URL không được set trong biến môi trường")
     raise ValueError("REDIS_URL không được set")
 
-logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")  # Ẩn password trong log
+logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")
 parsed_url = urlparse(redis_url)
 
 # Kiểm tra DNS resolution
@@ -63,7 +70,7 @@ def redis_cached(ttl: int, namespace: str):
                 logger.info(f"Cache hit cho key: {key}")
                 return json.loads(cached_result)
             result = await func(*args, **kwargs)
-            await redis.setex(key, ttl, json.dumps(result))
+            await redis.setex(key, ttl, json.dumps(result, cls=EnhancedJSONEncoder))
             logger.info(f"Cache set cho key: {key} với TTL {ttl}s")
             return result
         return wrapper
@@ -177,12 +184,16 @@ async def get_contacts():
 @app.get("/get-messages")
 @redis_cached(ttl=60, namespace="get_messages")
 async def get_messages(contactId: Optional[int] = Query(None), page: int = 1, limit: int = 100):
-    query = {"contact_id": {"$exists": False}} if contactId is None else {"contact_id": contactId}
-    docs = await mongo.messages_collection.find(query).to_list(None)
-    messages = [msg for doc in docs for msg in doc.get("messages", [])]
-    messages.sort(key=lambda x: x.get("timestamp", ""))
-    start, end = (page - 1) * limit, page * limit
-    return messages[start:end]
+    try:
+        query = {"contact_id": {"$exists": False}} if contactId is None else {"contact_id": contactId}
+        docs = await mongo.messages_collection.find(query).to_list(None)
+        messages = [msg for doc in docs for msg in doc.get("messages", [])]
+        messages.sort(key=lambda x: x.get("timestamp", ""))
+        start, end = (page - 1) * limit, page * limit
+        return messages[start:end]
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy tin nhắn: {e}")
+        raise HTTPException(status_code=500, detail="Lỗi máy chủ khi truy vấn tin nhắn")
 
 @app.get("/count-messages")
 async def count_messages(contactId: Optional[int] = Query(None)):
@@ -195,14 +206,19 @@ async def send_message(message: SendMessage):
     query = {"contact_id": message.contactId} if message.contactId else {"contact_id": {"$exists": False}}
     await mongo.messages_collection.update_one(query, {"$push": {"messages": message.dict()}}, upsert=True)
     if message.contactId:
-        await mongo.contacts_collection.update_one({"id": message.contactId}, {"$set": {"lastMessage": message.content, "timestamp": message.timestamp}})
+        await mongo.contacts_collection.update_one({"id": message.contactId}, {
+            "lastMessage": message.content,
+            "timestamp": message.timestamp
+        })
     await redis.delete("get_messages")
     return {"message": "Message sent"}
 
 @app.post("/upload-messages")
 async def upload_messages(data: UploadMessages):
     query = {"contact_id": data.contactId} if data.contactId else {"contact_id": {"$exists": False}}
-    await mongo.messages_collection.update_one(query, {"$push": {"messages": {"$each": [msg.dict() for msg in data.messages]}}}, upsert=True)
+    await mongo.messages_collection.update_one(query, {
+        "$push": {"messages": {"$each": [msg.dict() for msg in data.messages]}}
+    }, upsert=True)
     await redis.delete("get_messages")
     return {"message": f"Uploaded {len(data.messages)} messages"}
 
