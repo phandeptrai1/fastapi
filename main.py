@@ -1,11 +1,11 @@
 import os
 import logging
 import socket
-import asyncio
 import json
 from typing import List, Optional
 from datetime import datetime
 from functools import wraps
+
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
@@ -17,21 +17,14 @@ from fastapi_limiter.depends import RateLimiter
 from collections import defaultdict
 from urllib.parse import urlparse
 
-# Hỗ trợ serialize datetime trong JSON
-class EnhancedJSONEncoder(json.JSONEncoder):
-    def default(self, o):
-        if isinstance(o, datetime):
-            return o.isoformat()
-        return super().default(o)
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Logging setup
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("chat_api")
-
-# FastAPI app init
+# App instance
 app = FastAPI(title="Pro Chat API")
 
-# Middleware setup
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,92 +33,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Redis setup
-redis_url = os.getenv("REDIS_URL")
-if not redis_url:
-    logger.error("REDIS_URL không được set trong biến môi trường")
-    raise ValueError("REDIS_URL không được set")
-
-logger.info(f"Đang kết nối tới Redis tại: {redis_url.split('@')[-1]}")
-parsed_url = urlparse(redis_url)
-
-# Kiểm tra DNS resolution
-try:
-    socket.gethostbyname(parsed_url.hostname)
-    logger.info(f"DNS resolved: {parsed_url.hostname}")
-except socket.gaierror as e:
-    logger.warning(f"DNS resolution failed for {parsed_url.hostname}: {e}")
-
-# Global redis client
+# Global variables
 redis = None
+mongo = None
+active_websockets = defaultdict(list)
+MAX_WEBSOCKETS = 50
 
-# Custom Redis cache decorator
+# JSON encoder for datetime
+class EnhancedJSONEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, datetime):
+            return o.isoformat()
+        return super().default(o)
+
+# Redis cache decorator
 def redis_cached(ttl: int, namespace: str):
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            key = f"{namespace}:{json.dumps(kwargs, sort_keys=True)}"
-            cached_result = await redis.get(key)
-            if cached_result:
-                logger.info(f"Cache hit cho key: {key}")
-                return json.loads(cached_result)
-            result = await func(*args, **kwargs)
-            await redis.setex(key, ttl, json.dumps(result, cls=EnhancedJSONEncoder))
-            logger.info(f"Cache set cho key: {key} với TTL {ttl}s")
-            return result
+            if not redis:
+                return await func(*args, **kwargs)
+            try:
+                key = f"{namespace}:{json.dumps(kwargs, sort_keys=True)}"
+                cached = await redis.get(key)
+                if cached:
+                    return json.loads(cached)
+                result = await func(*args, **kwargs)
+                await redis.setex(key, ttl, json.dumps(result, cls=EnhancedJSONEncoder))
+                return result
+            except Exception as e:
+                logger.error(f"Redis cache error: {e}")
+                return await func(*args, **kwargs)
         return wrapper
     return decorator
 
-# WebSocket tracking
-MAX_WEBSOCKETS = 50
-active_websockets = defaultdict(list)
-
-# MongoDB Singleton
+# MongoDB connection
 class MongoDBConnection:
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            uri = os.getenv("MONGODB_URI")
-            if not uri:
-                raise ValueError("MONGODB_URI không được set")
-            cls._client = AsyncIOMotorClient(uri)
-            cls._db = cls._client["chat_app"]
-            cls._contacts = cls._db["contacts"]
-            cls._messages = cls._db["messages"]
-        return cls._instance
+    def __init__(self):
+        uri = os.getenv("MONGODB_URI")
+        if not uri:
+            raise ValueError("MONGODB_URI not set")
+        self.client = AsyncIOMotorClient(uri)
+        self.db = self.client.chat_app
+        self.contacts = self.db.contacts
+        self.messages = self.db.messages
 
     async def init_indexes(self):
-        await self._contacts.create_index("id")
-        await self._messages.create_index("contact_id")
+        await self.contacts.create_index("id")
+        await self.messages.create_index("contact_id")
 
-    @property
-    def client(self): return self._client
-    @property
-    def db(self): return self._db
-    @property
-    def contacts_collection(self): return self._contacts
-    @property
-    def messages_collection(self): return self._messages
-
-mongo = MongoDBConnection()
-
-# Pydantic Models
+# Pydantic models
 class Message(BaseModel):
     role: str = Field(..., regex="^(user|assistant|system)$")
     content: str
     timestamp: datetime
 
     @validator("timestamp", pre=True)
-    def parse_custom_timestamp(cls, value):
-        if isinstance(value, datetime):
-            return value
-        try:
-            dt = datetime.strptime(value, "%H:%M %d/%m")
-            return dt.replace(year=datetime.utcnow().year)
-        except ValueError:
-            raise ValueError("timestamp phải có định dạng 'HH:mm dd/MM'")
+    def parse_time(cls, v):
+        if isinstance(v, datetime):
+            return v
+        return datetime.strptime(v, "%H:%M %d/%m").replace(year=datetime.utcnow().year)
 
 class SendMessage(Message):
     contactId: Optional[int] = None
@@ -134,134 +101,123 @@ class UploadMessages(BaseModel):
     messages: List[Message]
     contactId: Optional[int] = None
 
-# App startup
+# Startup and shutdown
 @app.on_event("startup")
-async def startup_event():
-    global redis
-    await mongo.init_indexes()
+async def startup():
+    global redis, mongo
     try:
-        redis = aioredis.from_url(redis_url, decode_responses=True)
-        await redis.ping()
-        await FastAPILimiter.init(redis)
-        logger.info("Redis và FastAPILimiter đã khởi tạo thành công")
+        redis_url = os.getenv("REDIS_URL")
+        if redis_url:
+            redis = aioredis.from_url(redis_url, decode_responses=True)
+            await redis.ping()
+            await FastAPILimiter.init(redis)
+            logger.info("Redis initialized")
+        else:
+            logger.warning("REDIS_URL not set, Redis disabled")
     except Exception as e:
-        logger.error(f"Redis init failed: {e}")
-        raise
+        logger.error(f"Failed to init Redis: {e}")
+        redis = None
+
+    mongo = MongoDBConnection()
+    await mongo.init_indexes()
 
 @app.on_event("shutdown")
-async def shutdown_event():
+async def shutdown():
     mongo.client.close()
     if redis:
         await redis.close()
-    logger.info("MongoDB và Redis connections đã được đóng")
 
 @app.get("/")
-async def home():
-    return {"message": "🚀 Pro Chat API is running!"}
+async def root():
+    return {"message": "✅ Chat API ready"}
+
+@app.get("/healthcheck")
+async def healthcheck():
+    return {"status": "ok"}
 
 @app.get("/test-db")
 async def test_db():
     try:
         await mongo.client.admin.command("ping")
-        collections = await mongo.db.list_collection_names()
-        return {"collections": collections}
+        return {"db": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/test-redis")
 async def test_redis():
     try:
-        pong = await redis.ping()
-        return {"message": "Redis connection OK", "response": pong}
+        if redis:
+            pong = await redis.ping()
+            return {"redis": pong}
+        return {"redis": "not configured"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Redis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get-contacts")
-@redis_cached(ttl=60, namespace="get_contacts")
+@redis_cached(60, "get_contacts")
 async def get_contacts():
-    return await mongo.contacts_collection.find({}, {"_id": 0}).to_list(None)
+    return await mongo.contacts.find({}, {"_id": 0}).to_list(None)
 
 @app.get("/get-messages")
-@redis_cached(ttl=60, namespace="get_messages")
+@redis_cached(60, "get_messages")
 async def get_messages(contactId: Optional[int] = Query(None), page: int = 1, limit: int = 100):
-    try:
-        query = {"contact_id": {"$exists": False}} if contactId is None else {"contact_id": contactId}
-        docs = await mongo.messages_collection.find(query).to_list(None)
-        messages = [msg for doc in docs for msg in doc.get("messages", [])]
-        messages.sort(key=lambda x: x.get("timestamp", ""))
-        start, end = (page - 1) * limit, page * limit
-        return messages[start:end]
-    except Exception as e:
-        logger.error(f"Lỗi khi lấy tin nhắn: {e}")
-        raise HTTPException(status_code=500, detail="Lỗi máy chủ khi truy vấn tin nhắn")
-
-@app.get("/count-messages")
-async def count_messages(contactId: Optional[int] = Query(None)):
-    query = {"contact_id": {"$exists": False}} if contactId is None else {"contact_id": contactId}
-    docs = await mongo.messages_collection.find(query).to_list(None)
-    return {"contactId": contactId, "totalMessages": sum(len(doc.get("messages", [])) for doc in docs)}
+    query = {"contact_id": contactId} if contactId is not None else {"contact_id": {"$exists": False}}
+    docs = await mongo.messages.find(query).to_list(None)
+    messages = [msg for doc in docs for msg in doc.get("messages", [])]
+    messages.sort(key=lambda x: x.get("timestamp", ""))
+    return messages[(page-1)*limit : page*limit]
 
 @app.post("/send-message", dependencies=[Depends(RateLimiter(times=5, seconds=10))])
-async def send_message(message: SendMessage):
-    query = {"contact_id": message.contactId} if message.contactId else {"contact_id": {"$exists": False}}
-    await mongo.messages_collection.update_one(query, {"$push": {"messages": message.dict()}}, upsert=True)
-    if message.contactId:
-        await mongo.contacts_collection.update_one({"id": message.contactId}, {
-            "lastMessage": message.content,
-            "timestamp": message.timestamp
-        })
-    await redis.delete("get_messages")
-    return {"message": "Message sent"}
+async def send_message(msg: SendMessage):
+    query = {"contact_id": msg.contactId} if msg.contactId else {"contact_id": {"$exists": False}}
+    await mongo.messages.update_one(query, {"$push": {"messages": msg.dict()}}, upsert=True)
+    if msg.contactId:
+        await mongo.contacts.update_one({"id": msg.contactId}, {"$set": {"lastMessage": msg.content, "timestamp": msg.timestamp}})
+    if redis:
+        await redis.delete("get_messages")
+    return {"message": "sent"}
 
 @app.post("/upload-messages")
 async def upload_messages(data: UploadMessages):
     query = {"contact_id": data.contactId} if data.contactId else {"contact_id": {"$exists": False}}
-    await mongo.messages_collection.update_one(query, {
-        "$push": {"messages": {"$each": [msg.dict() for msg in data.messages]}}
-    }, upsert=True)
-    await redis.delete("get_messages")
+    await mongo.messages.update_one(query, {"$push": {"messages": {"$each": [m.dict() for m in data.messages]}}}, upsert=True)
+    if redis:
+        await redis.delete("get_messages")
     return {"message": f"Uploaded {len(data.messages)} messages"}
 
-@app.delete("/clear-messages/{document_id}")
-async def clear_messages(document_id: str):
+@app.delete("/clear-messages/{doc_id}")
+async def clear_messages(doc_id: str):
     try:
-        object_id = ObjectId(document_id)
-        result = await mongo.messages_collection.update_one({"_id": object_id}, {"$set": {"messages": []}})
-        if result.matched_count == 0:
+        oid = ObjectId(doc_id)
+        res = await mongo.messages.update_one({"_id": oid}, {"$set": {"messages": []}})
+        if not res.matched_count:
             raise HTTPException(status_code=404, detail="Document not found")
-        await redis.delete("get_messages")
-        return {"message": f"Cleared messages in document {document_id}"}
+        if redis:
+            await redis.delete("get_messages")
+        return {"message": "cleared"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/ws/{contact_id}")
-async def websocket_endpoint(websocket: WebSocket, contact_id: int):
+async def websocket_endpoint(ws: WebSocket, contact_id: int):
     if len(active_websockets[contact_id]) >= MAX_WEBSOCKETS:
-        await websocket.close(code=1008, reason="Too many connections")
+        await ws.close(code=1008, reason="Too many connections")
         return
-    await websocket.accept()
-    active_websockets[contact_id].append(websocket)
+    await ws.accept()
+    active_websockets[contact_id].append(ws)
     try:
         while True:
-            data = await websocket.receive_text()
-            message = {
-                "role": "user",
-                "content": data,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            await mongo.messages_collection.update_one(
-                {"contact_id": contact_id},
-                {"$push": {"messages": message}},
-                upsert=True
-            )
-            for ws in active_websockets[contact_id]:
-                await ws.send_json({"contact_id": contact_id, "message": message})
+            text = await ws.receive_text()
+            msg = {"role": "user", "content": text, "timestamp": datetime.utcnow().isoformat()}
+            await mongo.messages.update_one({"contact_id": contact_id}, {"$push": {"messages": msg}}, upsert=True)
+            for conn in active_websockets[contact_id]:
+                await conn.send_json({"contact_id": contact_id, "message": msg})
     except WebSocketDisconnect:
-        active_websockets[contact_id].remove(websocket)
+        active_websockets[contact_id].remove(ws)
     except Exception as e:
-        active_websockets[contact_id].remove(websocket)
         logger.error(f"WebSocket error: {e}")
+        active_websockets[contact_id].remove(ws)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
