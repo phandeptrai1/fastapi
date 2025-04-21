@@ -5,6 +5,8 @@ services:
     plan: free # hoặc starter nếu bạn cần tài nguyên lớn hơn
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port 5000
+    healthCheckPath: /healthcheck
     envVars:
       - key: MONGODB_URI
         sync: false # Biến này sẽ được thêm thủ công trên Render
+        
