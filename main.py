@@ -1,9 +1,8 @@
 import os
 import logging
-import socket
 import json
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends
@@ -15,7 +14,6 @@ from redis import asyncio as aioredis
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
 from collections import defaultdict
-from urllib.parse import urlparse
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -92,7 +90,10 @@ class Message(BaseModel):
     def parse_time(cls, v):
         if isinstance(v, datetime):
             return v
-        return datetime.strptime(v, "%H:%M %d/%m").replace(year=datetime.utcnow().year)
+        try:
+            return datetime.fromisoformat(v)
+        except:
+            return datetime.strptime(v, "%H:%M %d/%m").replace(year=datetime.utcnow().year)
 
 class SendMessage(Message):
     contactId: Optional[int] = None
@@ -158,21 +159,30 @@ async def test_redis():
 async def get_contacts():
     return await mongo.contacts.find({}, {"_id": 0}).to_list(None)
 
+# ✅ Fix sort timestamp issue
+def normalize_ts(ts):
+    if isinstance(ts, datetime):
+        return ts.isoformat()
+    return str(ts)
+
 @app.get("/get-messages")
 @redis_cached(60, "get_messages")
 async def get_messages(contactId: Optional[int] = Query(None), page: int = 1, limit: int = 100):
     query = {"contact_id": contactId} if contactId is not None else {"contact_id": {"$exists": False}}
     docs = await mongo.messages.find(query).to_list(None)
     messages = [msg for doc in docs for msg in doc.get("messages", [])]
-    messages.sort(key=lambda x: x.get("timestamp", ""))
-    return messages[(page-1)*limit : page*limit]
+    messages.sort(key=lambda x: normalize_ts(x.get("timestamp", "")))
+    return messages[(page - 1) * limit: page * limit]
 
 @app.post("/send-message", dependencies=[Depends(RateLimiter(times=5, seconds=10))])
 async def send_message(msg: SendMessage):
     query = {"contact_id": msg.contactId} if msg.contactId else {"contact_id": {"$exists": False}}
     await mongo.messages.update_one(query, {"$push": {"messages": msg.dict()}}, upsert=True)
     if msg.contactId:
-        await mongo.contacts.update_one({"id": msg.contactId}, {"$set": {"lastMessage": msg.content, "timestamp": msg.timestamp}})
+        await mongo.contacts.update_one({"id": msg.contactId}, {
+            "lastMessage": msg.content,
+            "timestamp": msg.timestamp
+        }, upsert=True)
     if redis:
         await redis.delete("get_messages")
     return {"message": "sent"}
@@ -180,7 +190,11 @@ async def send_message(msg: SendMessage):
 @app.post("/upload-messages")
 async def upload_messages(data: UploadMessages):
     query = {"contact_id": data.contactId} if data.contactId else {"contact_id": {"$exists": False}}
-    await mongo.messages.update_one(query, {"$push": {"messages": {"$each": [m.dict() for m in data.messages]}}}, upsert=True)
+    await mongo.messages.update_one(query, {
+        "$push": {
+            "messages": {"$each": [m.dict() for m in data.messages]}
+        }
+    }, upsert=True)
     if redis:
         await redis.delete("get_messages")
     return {"message": f"Uploaded {len(data.messages)} messages"}
@@ -208,7 +222,11 @@ async def websocket_endpoint(ws: WebSocket, contact_id: int):
     try:
         while True:
             text = await ws.receive_text()
-            msg = {"role": "user", "content": text, "timestamp": datetime.utcnow().isoformat()}
+            msg = {
+                "role": "user",
+                "content": text,
+                "timestamp": datetime.now(timezone.utc).isoformat()  # timezone-aware
+            }
             await mongo.messages.update_one({"contact_id": contact_id}, {"$push": {"messages": msg}}, upsert=True)
             for conn in active_websockets[contact_id]:
                 await conn.send_json({"contact_id": contact_id, "message": msg})
