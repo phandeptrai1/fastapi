@@ -9,7 +9,6 @@ from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 # FastAPI app
 app = FastAPI(title="Pro Chat + Karaoke API")
 
-# CORS
+# CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,16 +32,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static files (for optional upload UI)
-app.mount("/public", StaticFiles(directory="public"), name="public")
-
-# Globals
+# Global state
 redis = None
 mongo = None
 active_websockets = defaultdict(list)
 MAX_WEBSOCKETS = 50
 
-# Redis cache decorator
+# Redis cache helper
 class EnhancedJSONEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, datetime):
@@ -69,7 +65,7 @@ def redis_cached(ttl: int, namespace: str):
         return wrapper
     return decorator
 
-# Mongo connection
+# MongoDB setup
 class MongoDBConnection:
     def __init__(self):
         uri = os.getenv("MONGODB_URI")
@@ -88,7 +84,7 @@ class MongoDBConnection:
         await self.karaoke_songs.create_index("videoId", unique=True)
         await self.karaoke_lyrics.create_index("videoId", unique=True)
 
-# Pydantic models
+# Models
 class Message(BaseModel):
     role: str = Field(..., regex="^(user|assistant|system)$")
     content: str
@@ -120,7 +116,7 @@ class KaraokeSong(BaseModel):
     def default_thumb(cls, v, values):
         return v or f"https://i.ytimg.com/vi/{values.get('videoId')}/hqdefault.jpg"
 
-# Startup & Shutdown
+# Startup / Shutdown
 @app.on_event("startup")
 async def startup():
     global redis, mongo
@@ -234,7 +230,7 @@ async def websocket_endpoint(ws: WebSocket, contact_id: int):
     except WebSocketDisconnect:
         active_websockets[contact_id].remove(ws)
 
-# ===================== KARAOKE =====================
+# ========== Karaoke APIs ==========
 @app.get("/api/songs", response_model=List[KaraokeSong])
 async def get_karaoke_songs():
     return await mongo.karaoke_songs.find({}, {"_id": 0}).to_list(None)
