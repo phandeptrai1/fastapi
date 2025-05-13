@@ -4,25 +4,27 @@ import json
 from typing import List, Optional
 from datetime import datetime, timezone
 from functools import wraps
+from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from redis import asyncio as aioredis
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
-from collections import defaultdict
 
-# Setup logging
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# App instance
-app = FastAPI(title="Pro Chat API")
+# FastAPI app
+app = FastAPI(title="Pro Chat + Karaoke API")
 
-# CORS middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,20 +33,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables
+# Static files (for optional upload UI)
+app.mount("/public", StaticFiles(directory="public"), name="public")
+
+# Globals
 redis = None
 mongo = None
 active_websockets = defaultdict(list)
 MAX_WEBSOCKETS = 50
 
-# JSON encoder for datetime
+# Redis cache decorator
 class EnhancedJSONEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, datetime):
             return o.isoformat()
         return super().default(o)
 
-# Redis cache decorator
 def redis_cached(ttl: int, namespace: str):
     def decorator(func):
         @wraps(func)
@@ -65,7 +69,7 @@ def redis_cached(ttl: int, namespace: str):
         return wrapper
     return decorator
 
-# MongoDB connection
+# Mongo connection
 class MongoDBConnection:
     def __init__(self):
         uri = os.getenv("MONGODB_URI")
@@ -75,10 +79,14 @@ class MongoDBConnection:
         self.db = self.client.chat_app
         self.contacts = self.db.contacts
         self.messages = self.db.messages
+        self.karaoke_songs = self.db.karaoke_songs
+        self.karaoke_lyrics = self.db.karaoke_lyrics
 
     async def init_indexes(self):
         await self.contacts.create_index("id")
         await self.messages.create_index("contact_id")
+        await self.karaoke_songs.create_index("videoId", unique=True)
+        await self.karaoke_lyrics.create_index("videoId", unique=True)
 
 # Pydantic models
 class Message(BaseModel):
@@ -102,7 +110,17 @@ class UploadMessages(BaseModel):
     messages: List[Message]
     contactId: Optional[int] = None
 
-# Startup and shutdown
+class KaraokeSong(BaseModel):
+    videoId: str
+    title: str
+    artist: str
+    thumbnail: Optional[str] = None
+
+    @validator("thumbnail", always=True)
+    def default_thumb(cls, v, values):
+        return v or f"https://i.ytimg.com/vi/{values.get('videoId')}/hqdefault.jpg"
+
+# Startup & Shutdown
 @app.on_event("startup")
 async def startup():
     global redis, mongo
@@ -112,11 +130,9 @@ async def startup():
             redis = aioredis.from_url(redis_url, decode_responses=True)
             await redis.ping()
             await FastAPILimiter.init(redis)
-            logger.info("Redis initialized")
-        else:
-            logger.warning("REDIS_URL not set, Redis disabled")
+            logger.info("✅ Redis initialized")
     except Exception as e:
-        logger.error(f"Failed to init Redis: {e}")
+        logger.warning(f"Redis init failed: {e}")
         redis = None
 
     mongo = MongoDBConnection()
@@ -130,7 +146,7 @@ async def shutdown():
 
 @app.get("/")
 async def root():
-    return {"message": "✅ Chat API ready"}
+    return {"message": "✅ API Ready"}
 
 @app.get("/healthcheck")
 async def healthcheck():
@@ -138,37 +154,27 @@ async def healthcheck():
 
 @app.get("/test-db")
 async def test_db():
-    try:
-        await mongo.client.admin.command("ping")
-        return {"db": "ok"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    await mongo.client.admin.command("ping")
+    return {"db": "ok"}
 
 @app.get("/test-redis")
 async def test_redis():
-    try:
-        if redis:
-            pong = await redis.ping()
-            return {"redis": pong}
-        return {"redis": "not configured"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    if redis:
+        return {"redis": await redis.ping()}
+    return {"redis": "not configured"}
 
 @app.get("/get-contacts")
 @redis_cached(60, "get_contacts")
 async def get_contacts():
     return await mongo.contacts.find({}, {"_id": 0}).to_list(None)
 
-# ✅ Fix sort timestamp issue
 def normalize_ts(ts):
-    if isinstance(ts, datetime):
-        return ts.isoformat()
-    return str(ts)
+    return ts.isoformat() if isinstance(ts, datetime) else str(ts)
 
 @app.get("/get-messages")
 @redis_cached(60, "get_messages")
 async def get_messages(contactId: Optional[int] = Query(None), page: int = 1, limit: int = 100):
-    query = {"contact_id": contactId} if contactId is not None else {"contact_id": {"$exists": False}}
+    query = {"contact_id": contactId} if contactId else {"contact_id": {"$exists": False}}
     docs = await mongo.messages.find(query).to_list(None)
     messages = [msg for doc in docs for msg in doc.get("messages", [])]
     messages.sort(key=lambda x: normalize_ts(x.get("timestamp", "")))
@@ -191,9 +197,7 @@ async def send_message(msg: SendMessage):
 async def upload_messages(data: UploadMessages):
     query = {"contact_id": data.contactId} if data.contactId else {"contact_id": {"$exists": False}}
     await mongo.messages.update_one(query, {
-        "$push": {
-            "messages": {"$each": [m.dict() for m in data.messages]}
-        }
+        "$push": {"messages": {"$each": [m.dict() for m in data.messages]}}
     }, upsert=True)
     if redis:
         await redis.delete("get_messages")
@@ -201,16 +205,13 @@ async def upload_messages(data: UploadMessages):
 
 @app.delete("/clear-messages/{doc_id}")
 async def clear_messages(doc_id: str):
-    try:
-        oid = ObjectId(doc_id)
-        res = await mongo.messages.update_one({"_id": oid}, {"$set": {"messages": []}})
-        if not res.matched_count:
-            raise HTTPException(status_code=404, detail="Document not found")
-        if redis:
-            await redis.delete("get_messages")
-        return {"message": "cleared"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    oid = ObjectId(doc_id)
+    res = await mongo.messages.update_one({"_id": oid}, {"$set": {"messages": []}})
+    if not res.matched_count:
+        raise HTTPException(status_code=404, detail="Not found")
+    if redis:
+        await redis.delete("get_messages")
+    return {"message": "cleared"}
 
 @app.websocket("/ws/{contact_id}")
 async def websocket_endpoint(ws: WebSocket, contact_id: int):
@@ -225,17 +226,47 @@ async def websocket_endpoint(ws: WebSocket, contact_id: int):
             msg = {
                 "role": "user",
                 "content": text,
-                "timestamp": datetime.now(timezone.utc).isoformat()  # timezone-aware
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
             await mongo.messages.update_one({"contact_id": contact_id}, {"$push": {"messages": msg}}, upsert=True)
             for conn in active_websockets[contact_id]:
                 await conn.send_json({"contact_id": contact_id, "message": msg})
     except WebSocketDisconnect:
         active_websockets[contact_id].remove(ws)
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        active_websockets[contact_id].remove(ws)
 
+# ===================== KARAOKE =====================
+@app.get("/api/songs", response_model=List[KaraokeSong])
+async def get_karaoke_songs():
+    return await mongo.karaoke_songs.find({}, {"_id": 0}).to_list(None)
+
+@app.post("/api/songs")
+async def add_karaoke_song(song: KaraokeSong):
+    if await mongo.karaoke_songs.find_one({"videoId": song.videoId}):
+        raise HTTPException(status_code=400, detail="Bài hát đã tồn tại")
+    await mongo.karaoke_songs.insert_one(song.dict())
+    return {"message": "Đã thêm bài hát"}
+
+@app.post("/api/lyrics/upload/{video_id}")
+async def upload_lyrics_file(video_id: str, file: UploadFile = File(...)):
+    if not file.filename.endswith(".srt"):
+        raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file .srt")
+    content = await file.read()
+    lyrics_text = content.decode("utf-8")
+    await mongo.karaoke_lyrics.update_one(
+        {"videoId": video_id},
+        {"$set": {"lyrics": lyrics_text}},
+        upsert=True
+    )
+    return {"message": f"Đã lưu lời bài hát cho {video_id}"}
+
+@app.get("/api/lyrics/{video_id}", response_class=PlainTextResponse)
+async def get_lyrics(video_id: str):
+    doc = await mongo.karaoke_lyrics.find_one({"videoId": video_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Không có lời bài hát")
+    return doc["lyrics"]
+
+# Entry point
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
