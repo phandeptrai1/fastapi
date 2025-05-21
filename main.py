@@ -111,6 +111,7 @@ class KaraokeSong(BaseModel):
     title: str
     artist: str
     thumbnail: Optional[str] = None
+    mood: Optional[str] = None  # Thêm trường mood
 
     @validator("thumbnail", always=True)
     def default_thumb(cls, v, values):
