@@ -8,3 +8,8 @@ redis>=4.2.0
 fastapi-limiter==0.1.5
 python-dotenv>=0.21.0
 python-multipart
+numpy
+nltk
+scikit-learn
+joblib
+
