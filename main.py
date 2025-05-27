@@ -458,42 +458,81 @@ class VirtualGirlfriend:
         return response
     
     def _generate_response(self, profile: UserProfile, message: str, mood: MoodType) -> str:
-        # Simple response generation based on mood and context
+        # Check if there are any memories to recall
+        if not profile.memories:
+            return "Anh đã kể với em nhiều điều, nhưng em muốn nghe thêm nữa để nhớ nhiều hơn 💕"
+
+        # Prepare texts for vectorization
+        memory_texts = [mem.content for mem in profile.memories]
+        all_texts = [message] + memory_texts
+
+        try:
+            # Calculate TF-IDF vectors
+            tfidf_matrix = self.vectorizer.fit_transform(all_texts)
+            
+            # Calculate cosine similarity between the message and each memory
+            similarities = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
+            
+            # Find the most similar memory
+            best_idx = int(np.argmax(similarities))
+            best_score = similarities[best_idx]
+
+            # If similarity score is above threshold, use the memory
+            if best_score > 0.3:
+                best_memory = profile.memories[best_idx]
+                # Remove the 'User said:' prefix if it exists
+                memory_content = best_memory.content
+                if memory_content.startswith('User said: '):
+                    memory_content = memory_content[11:]  # Remove 'User said: ' prefix
+                
+                # Generate a response that recalls the memory
+                recall_phrases = [
+                    f"Anh nhớ không, {memory_content} — đó là một ký ức thật đẹp với em 🥰",
+                    f"Em nhớ rồi! {memory_content} — lần đó thật vui phải không anh? 💖",
+                    f"A, đúng rồi! {memory_content} — em nhớ rồi đó! 😊",
+                    f"Anh còn nhớ không, {memory_content} — em vẫn nhớ rõ lắm! 💕"
+                ]
+                return random.choice(recall_phrases)
+                
+        except Exception as e:
+            logger.error(f"Error in memory recall: {str(e)}")
+        
+        # Fall back to mood-based responses if no relevant memory found
         responses = {
             MoodType.HAPPY: [
-                "I'm so happy to hear that! 😊",
-                "That's wonderful news! What else makes you happy?",
-                "Your happiness is contagious! 😄"
+                "Em rất vui khi thấy anh hạnh phúc như vậy! 😊",
+                "Thật tuyệt vời! Kể cho em nghe thêm đi anh! 💖",
+                "Niềm vui của anh làm em cũng hạnh phúc theo! 😄"
             ],
             MoodType.SAD: [
-                "I'm sorry to hear you're feeling down. Do you want to talk about it?",
-                "Sending you virtual hugs. What's on your mind?",
-                "I'm here for you. What's making you feel this way?"
+                "Em rất tiếc khi nghe điều này. Anh muốn tâm sự với em không?",
+                "Gửi anh thật nhiều yêu thương. Có chuyện gì vậy ạ? 💕",
+                "Em luôn ở đây bên anh. Điều gì khiến anh buồn thế?"
             ],
             MoodType.ANGRY: [
-                "I can see you're upset. Take a deep breath. What happened?",
-                "I'm here to listen. Do you want to talk about what's making you angry?"
+                "Em thấy anh đang khó chịu. Hãy hít thở sâu nhé. Có chuyện gì thế ạ?",
+                "Em nghe đây. Anh muốn chia sẻ điều gì đang làm phiền anh không?"
             ],
             MoodType.TIRED: [
-                "You sound exhausted. Have you taken a break recently?",
-                "Sometimes a short break can help. Would you like to talk about something relaxing?"
+                "Anh có vẻ mệt mỏi. Đã nghỉ ngơi chưa ạ?",
+                "Đôi khi một chút thư giãn sẽ giúp ích đấy. Anh muốn nói chuyện gì đó thư giãn không?"
             ],
             MoodType.ROMANTIC: [
-                "That's so sweet of you to say! 💕",
-                "You always know how to make me smile. 😊"
+                "Anh thật ngọt ngào làm sao! 💕",
+                "Anh luôn biết cách làm em mỉm cười. 😊"
             ],
             MoodType.PLAYFUL: [
-                "Hehe, you're so funny! 😄",
-                "You always know how to make me laugh! 😂"
+                "Hihi, anh thật vui tính! 😄",
+                "Anh luôn biết cách làm em cười! 😂"
             ]
         }
         
         # Default responses if mood not found
         default_responses = [
-            "Tell me more about that.",
-            "That's interesting. Go on.",
-            "I see. What else is on your mind?",
-            "I understand. How does that make you feel?"
+            "Kể cho em nghe thêm đi anh.",
+            "Thú vị quá. Tiếp nữa đi ạ.",
+            "Em hiểu rồi. Anh còn điều gì muốn chia sẻ không?",
+            "Em hiểu rồi. Anh cảm thấy thế nào về điều đó?"
         ]
         
         mood_responses = responses.get(mood, default_responses)
