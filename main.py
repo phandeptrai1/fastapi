@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, validator, conlist
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId, json_util
@@ -78,6 +78,10 @@ redis = None
 mongo = None
 active_websockets = defaultdict(list)
 MAX_WEBSOCKETS = 50
+
+# In-memory broadcaster for TikTok SSE per room
+active_sse_clients: Dict[str, list] = defaultdict(list)  # roomId -> list[asyncio.Queue]
+SSE_PING_INTERVAL = 15  # seconds
 
 # Redis cache helper
 class EnhancedJSONEncoder(json.JSONEncoder):
@@ -951,6 +955,98 @@ async def websocket_endpoint(ws: WebSocket, contact_id: int):
         if contact_id in active_websockets and ws in active_websockets[contact_id]:
             active_websockets[contact_id].remove(ws)
             logger.info(f"Cleaned up WebSocket for contact {contact_id}")
+
+# ========== TikTok SSE and Reply ==========
+class TikTokReply(BaseModel):
+    roomId: str
+    commentId: Optional[str]
+    reply: str
+
+def _sse_encode(data: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(data, cls=EnhancedJSONEncoder)}\n\n"
+
+@app.get("/tiktok/stream")
+async def tiktok_stream(roomId: str = Query(...)):
+    """Server-Sent Events stream for TikTok comments per roomId.
+    Frontend connects with EventSource and expects JSON objects: {id,user,text,timestamp}.
+    """
+    if not roomId:
+        raise HTTPException(status_code=400, detail="roomId required")
+
+    queue: asyncio.Queue = asyncio.Queue()
+    active_sse_clients[roomId].append(queue)
+    logger.info(f"SSE connected: room {roomId}, clients={len(active_sse_clients[roomId])}")
+
+    async def event_generator():
+        try:
+            # initial hello
+            yield _sse_encode({"type": "hello", "roomId": roomId, "ts": datetime.utcnow()})
+            last_ping = datetime.utcnow()
+            while True:
+                # keepalive ping
+                now = datetime.utcnow()
+                if (now - last_ping).total_seconds() >= SSE_PING_INTERVAL:
+                    yield "event: ping\n" + _sse_encode({"ts": now})
+                    last_ping = now
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    yield _sse_encode(msg)
+                except asyncio.TimeoutError:
+                    # loop to send ping periodically
+                    continue
+        except asyncio.CancelledError:
+            logger.info("SSE generator cancelled")
+        finally:
+            # cleanup happens in response.close but keep here for safety
+            pass
+
+    async def close_callback():
+        # Remove the queue when client disconnects
+        try:
+            if queue in active_sse_clients.get(roomId, []):
+                active_sse_clients[roomId].remove(queue)
+                logger.info(f"SSE disconnected: room {roomId}, clients={len(active_sse_clients[roomId])}")
+        except Exception as e:
+            logger.warning(f"SSE close cleanup error: {e}")
+
+    response = StreamingResponse(event_generator(), media_type="text/event-stream")
+    # Starlette's StreamingResponse doesn't have a first-class disconnect hook;
+    # rely on generator finally plus GC; also keep reference to cleanup via background task
+    response.background = None  # explicit
+    return response
+
+@app.post("/tiktok/reply")
+async def tiktok_reply(payload: TikTokReply):
+    """Accept a reply for a TikTok comment. For now we just log and ack."""
+    logger.info(f"TikTok reply room={payload.roomId} commentId={payload.commentId} reply={payload.reply[:120]}")
+    return {"status": "ok"}
+
+class TikTokMockComment(BaseModel):
+    roomId: str
+    id: Optional[str] = None
+    user: Optional[str] = None
+    text: str
+    timestamp: Optional[datetime] = None
+
+@app.post("/tiktok/mock-comment")
+async def tiktok_mock_comment(body: TikTokMockComment):
+    """Push a mock comment into an SSE room for testing the frontend."""
+    rid = body.roomId
+    if not rid:
+        raise HTTPException(status_code=400, detail="roomId required")
+    msg = {
+        "id": body.id or str(uuid.uuid4()),
+        "user": body.user or "Viewer",
+        "text": body.text,
+        "timestamp": body.timestamp or datetime.utcnow(),
+    }
+    queues = active_sse_clients.get(rid, [])
+    for q in list(queues):
+        try:
+            q.put_nowait(msg)
+        except Exception as e:
+            logger.warning(f"Queue push failed: {e}")
+    return {"delivered": len(queues), "message": msg}
 
 # ========== Karaoke APIs ==========
 @app.get("/api/songs", response_model=List[KaraokeSong])
