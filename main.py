@@ -131,7 +131,7 @@ except Exception as _e:
 # Manage live listeners per "roomId" (we'll treat provided value as TikTok unique_id/username)
 tiktok_live_managers: Dict[str, Dict[str, Any]] = {}
 
-async def ensure_tiktok_listener(room_id: str):
+async def ensure_tiktok_listener(room_id: str, overrides: Optional[Dict[str, Any]] = None):
     """Ensure a TikTokLive listener is running for the given room_id (username).
     When comments arrive, fan-out to SSE queues in active_sse_clients[room_id]."""
     if not TIKTOKLIVE_AVAILABLE:
@@ -143,8 +143,15 @@ async def ensure_tiktok_listener(room_id: str):
         # Already running
         return True
 
-    # Build client with optional signer config from environment
+    # Build client with optional signer/cookie config
     client_kwargs: Dict[str, Any] = {}
+    if overrides:
+        # Normalize possible keys from query
+        if overrides.get("msToken") and not overrides.get("ms_token"):
+            overrides["ms_token"] = overrides.get("msToken")
+        if overrides.get("verifyFp") and not overrides.get("verify_fp"):
+            overrides["verify_fp"] = overrides.get("verifyFp")
+        client_kwargs.update({k: v for k, v in overrides.items() if v})
     if room_id.isdigit():
         # Allow direct live room id
         try:
@@ -154,14 +161,14 @@ async def ensure_tiktok_listener(room_id: str):
     else:
         client_kwargs["unique_id"] = room_id
 
-    sign_api_key = os.getenv("TIKTOKLIVE_SIGN_API_KEY")
-    signer_host = os.getenv("TIKTOKLIVE_SIGNER_HOST")  # e.g. https://tiktok.eulerstream.com
+    sign_api_key = client_kwargs.get("sign_api_key") or os.getenv("TIKTOKLIVE_SIGN_API_KEY")
+    signer_host = client_kwargs.get("signer_host") or os.getenv("TIKTOKLIVE_SIGNER_HOST")  # e.g. https://tiktok.eulerstream.com
 
     # Optional TikTok cookies to improve access when HTML parsing fails / region blocks
-    ms_token = os.getenv("TIKTOK_MS_TOKEN")
-    verify_fp = os.getenv("TIKTOK_VERIFY_FP")
-    ttwid = os.getenv("TIKTOK_TTWID")
-    sessionid = os.getenv("TIKTOK_SESSIONID")
+    ms_token = client_kwargs.get("ms_token") or os.getenv("TIKTOK_MS_TOKEN")
+    verify_fp = client_kwargs.get("verify_fp") or os.getenv("TIKTOK_VERIFY_FP")
+    ttwid = client_kwargs.get("ttwid") or os.getenv("TIKTOK_TTWID")
+    sessionid = client_kwargs.get("sessionid") or os.getenv("TIKTOK_SESSIONID")
 
     if ms_token:
         client_kwargs["ms_token"] = ms_token
@@ -1113,7 +1120,11 @@ def _sse_encode(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, cls=EnhancedJSONEncoder)}\n\n"
 
 @app.get("/tiktok/stream")
-async def tiktok_stream(roomId: str = Query(...)):
+async def tiktok_stream(
+    roomId: str = Query(...),
+    msToken: Optional[str] = Query(None),
+    verifyFp: Optional[str] = Query(None),
+):
     """Server-Sent Events stream for TikTok comments per roomId.
     Frontend connects with EventSource and expects JSON objects: {id,user,text,timestamp}.
     """
@@ -1128,7 +1139,8 @@ async def tiktok_stream(roomId: str = Query(...)):
     logger.info(f"SSE connected: room {roomId}, clients={len(active_sse_clients[roomId])}")
     # Ensure a TikTokLive listener is running for this room/user (if library available)
     try:
-        await ensure_tiktok_listener(roomId)
+        overrides = {"msToken": msToken, "verifyFp": verifyFp}
+        await ensure_tiktok_listener(roomId, overrides=overrides)
     except Exception as e:
         logger.warning(f"ensure_tiktok_listener error for {roomId}: {e}")
 
