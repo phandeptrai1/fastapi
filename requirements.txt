@@ -12,4 +12,6 @@ numpy
 nltk
 scikit-learn
 joblib
+tiktoklive
+
 
