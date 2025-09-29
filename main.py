@@ -145,15 +145,15 @@ async def ensure_tiktok_listener(room_id: str):
 
     client = TikTokLiveClient(unique_id=room_id)
 
-    @client.on("connect")
+    @client.on(ConnectEvent)
     async def on_connect(_: ConnectEvent):
         logger.info(f"TikTokLive connected for room/user '{room_id}'")
 
-    @client.on("disconnect")
+    @client.on(DisconnectEvent)
     async def on_disconnect(_: DisconnectEvent):
         logger.info(f"TikTokLive disconnected for room/user '{room_id}'")
 
-    @client.on("comment")
+    @client.on(CommentEvent)
     async def on_comment(event: CommentEvent):
         try:
             msg = {
