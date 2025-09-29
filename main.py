@@ -147,14 +147,16 @@ async def ensure_tiktok_listener(room_id: str, overrides: Optional[Dict[str, Any
     client_kwargs: Dict[str, Any] = {}
     if overrides:
         # Normalize possible keys from query
-        if overrides.get("msToken") and not overrides.get("ms_token"):
-            overrides["ms_token"] = overrides.get("msToken")
-        if overrides.get("verifyFp") and not overrides.get("verify_fp"):
-            overrides["verify_fp"] = overrides.get("verifyFp")
-        client_kwargs.update({k: v for k, v in overrides.items() if v})
-        # Drop unsupported alias keys to avoid passing unexpected kwargs
-        client_kwargs.pop("msToken", None)
-        client_kwargs.pop("verifyFp", None)
+        if overrides.get("msToken") and not overrides.get("custom_verify_fp"):
+            # TikTokLive uses custom_verify_fp; msToken from cookie maps to this
+            overrides["custom_verify_fp"] = overrides.get("msToken")
+        if overrides.get("verifyFp") and not overrides.get("custom_verify_fp"):
+            # Some contexts provide verifyFp; prefer it as custom_verify_fp if msToken not provided
+            overrides["custom_verify_fp"] = overrides.get("verifyFp")
+        # Only pick supported override keys we know are safe
+        for k in ("custom_verify_fp", "sign_api_key", "signer_host"):
+            if overrides.get(k):
+                client_kwargs[k] = overrides[k]
     if room_id.isdigit():
         # Allow direct live room id
         try:
@@ -167,36 +169,26 @@ async def ensure_tiktok_listener(room_id: str, overrides: Optional[Dict[str, Any
     sign_api_key = client_kwargs.get("sign_api_key") or os.getenv("TIKTOKLIVE_SIGN_API_KEY")
     signer_host = client_kwargs.get("signer_host") or os.getenv("TIKTOKLIVE_SIGNER_HOST")  # e.g. https://tiktok.eulerstream.com
 
-    # Optional TikTok cookies to improve access when HTML parsing fails / region blocks
-    ms_token = client_kwargs.get("ms_token") or os.getenv("TIKTOK_MS_TOKEN")
-    verify_fp = client_kwargs.get("verify_fp") or os.getenv("TIKTOK_VERIFY_FP")
-    ttwid = client_kwargs.get("ttwid") or os.getenv("TIKTOK_TTWID")
-    sessionid = client_kwargs.get("sessionid") or os.getenv("TIKTOK_SESSIONID")
+    # Preferred authentication cookie: custom_verify_fp
+    custom_verify_fp = client_kwargs.get("custom_verify_fp") or \
+        os.getenv("TIKTOK_CUSTOM_VERIFY_FP") or \
+        os.getenv("TIKTOK_MS_TOKEN") or \
+        os.getenv("TIKTOK_VERIFY_FP")
 
-    if ms_token:
-        client_kwargs["ms_token"] = ms_token
-    if verify_fp:
-        # Different libs may expect verifyFp or verify_fp; include both where harmless
-        client_kwargs["verify_fp"] = verify_fp
-        client_kwargs["verifyFp"] = verify_fp
-    if ttwid:
-        client_kwargs["ttwid"] = ttwid
-    if sessionid:
-        client_kwargs["sessionid"] = sessionid
+    # Apply effective settings to client kwargs
     if sign_api_key:
         client_kwargs["sign_api_key"] = sign_api_key
     if signer_host:
         client_kwargs["signer_host"] = signer_host
+    if custom_verify_fp:
+        client_kwargs["custom_verify_fp"] = custom_verify_fp
 
-    if sign_api_key or signer_host or ms_token or verify_fp or ttwid or sessionid:
+    if sign_api_key or signer_host or custom_verify_fp:
         logger.info(
             "Starting TikTokLiveClient with config: "
             f"signer_host={'set' if signer_host else 'default'}, "
             f"sign_api_key={'set' if sign_api_key else 'none'}, "
-            f"ms_token={'set' if ms_token else 'none'}, "
-            f"verify_fp={'set' if verify_fp else 'none'}, "
-            f"ttwid={'set' if ttwid else 'none'}, "
-            f"sessionid={'set' if sessionid else 'none'}"
+            f"custom_verify_fp={'set' if custom_verify_fp else 'none'}"
         )
 
     client = TikTokLiveClient(**client_kwargs)
