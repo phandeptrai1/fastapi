@@ -156,15 +156,37 @@ async def ensure_tiktok_listener(room_id: str):
 
     sign_api_key = os.getenv("TIKTOKLIVE_SIGN_API_KEY")
     signer_host = os.getenv("TIKTOKLIVE_SIGNER_HOST")  # e.g. https://tiktok.eulerstream.com
+
+    # Optional TikTok cookies to improve access when HTML parsing fails / region blocks
+    ms_token = os.getenv("TIKTOK_MS_TOKEN")
+    verify_fp = os.getenv("TIKTOK_VERIFY_FP")
+    ttwid = os.getenv("TIKTOK_TTWID")
+    sessionid = os.getenv("TIKTOK_SESSIONID")
+
+    if ms_token:
+        client_kwargs["ms_token"] = ms_token
+    if verify_fp:
+        # Different libs may expect verifyFp or verify_fp; include both where harmless
+        client_kwargs["verify_fp"] = verify_fp
+        client_kwargs["verifyFp"] = verify_fp
+    if ttwid:
+        client_kwargs["ttwid"] = ttwid
+    if sessionid:
+        client_kwargs["sessionid"] = sessionid
     if sign_api_key:
         client_kwargs["sign_api_key"] = sign_api_key
     if signer_host:
         client_kwargs["signer_host"] = signer_host
 
-    if sign_api_key or signer_host:
+    if sign_api_key or signer_host or ms_token or verify_fp or ttwid or sessionid:
         logger.info(
-            "Starting TikTokLiveClient with signer config: "
-            f"host={'set' if signer_host else 'default'}, apiKey={'set' if sign_api_key else 'none'}"
+            "Starting TikTokLiveClient with config: "
+            f"signer_host={'set' if signer_host else 'default'}, "
+            f"sign_api_key={'set' if sign_api_key else 'none'}, "
+            f"ms_token={'set' if ms_token else 'none'}, "
+            f"verify_fp={'set' if verify_fp else 'none'}, "
+            f"ttwid={'set' if ttwid else 'none'}, "
+            f"sessionid={'set' if sessionid else 'none'}"
         )
 
     client = TikTokLiveClient(**client_kwargs)
