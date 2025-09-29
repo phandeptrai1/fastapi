@@ -152,6 +152,9 @@ async def ensure_tiktok_listener(room_id: str, overrides: Optional[Dict[str, Any
         if overrides.get("verifyFp") and not overrides.get("verify_fp"):
             overrides["verify_fp"] = overrides.get("verifyFp")
         client_kwargs.update({k: v for k, v in overrides.items() if v})
+        # Drop unsupported alias keys to avoid passing unexpected kwargs
+        client_kwargs.pop("msToken", None)
+        client_kwargs.pop("verifyFp", None)
     if room_id.isdigit():
         # Allow direct live room id
         try:
