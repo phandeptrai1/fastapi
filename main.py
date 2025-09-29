@@ -143,7 +143,31 @@ async def ensure_tiktok_listener(room_id: str):
         # Already running
         return True
 
-    client = TikTokLiveClient(unique_id=room_id)
+    # Build client with optional signer config from environment
+    client_kwargs: Dict[str, Any] = {}
+    if room_id.isdigit():
+        # Allow direct live room id
+        try:
+            client_kwargs["room_id"] = int(room_id)
+        except Exception:
+            client_kwargs["unique_id"] = room_id
+    else:
+        client_kwargs["unique_id"] = room_id
+
+    sign_api_key = os.getenv("TIKTOKLIVE_SIGN_API_KEY")
+    signer_host = os.getenv("TIKTOKLIVE_SIGNER_HOST")  # e.g. https://tiktok.eulerstream.com
+    if sign_api_key:
+        client_kwargs["sign_api_key"] = sign_api_key
+    if signer_host:
+        client_kwargs["signer_host"] = signer_host
+
+    if sign_api_key or signer_host:
+        logger.info(
+            "Starting TikTokLiveClient with signer config: "
+            f"host={'set' if signer_host else 'default'}, apiKey={'set' if sign_api_key else 'none'}"
+        )
+
+    client = TikTokLiveClient(**client_kwargs)
 
     @client.on(ConnectEvent)
     async def on_connect(_: ConnectEvent):
