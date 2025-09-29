@@ -93,7 +93,7 @@ try:
         from TikTokLive.types.events import CommentEvent, ConnectEvent, DisconnectEvent
     except Exception:
         # Some distros expose alternate path
-        from Tiktoklive.events import CommentEvent, ConnectEvent, DisconnectEvent  # type: ignore
+        from TikToklive.events import CommentEvent, ConnectEvent, DisconnectEvent  # type: ignore
     TIKTOKLIVE_AVAILABLE = True
 except Exception as _e:
     tiktoklive_import_error = str(_e)
