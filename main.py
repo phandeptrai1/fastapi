@@ -87,16 +87,15 @@ SSE_PING_INTERVAL = 15  # seconds
 TIKTOKLIVE_AVAILABLE = False
 tiktoklive_import_error = None
 try:
+    # IMPORTANT: Correct casing required both in install and import
+    # pip install TikTokLive
     from TikTokLive import TikTokLiveClient
-    try:
-        # Official events path
-        from TikTokLive.types.events import CommentEvent, ConnectEvent, DisconnectEvent
-    except Exception:
-        # Some distros expose alternate path
-        from TikToklive.events import CommentEvent, ConnectEvent, DisconnectEvent  # type: ignore
+    from TikTokLive.types.events import CommentEvent, ConnectEvent, DisconnectEvent
     TIKTOKLIVE_AVAILABLE = True
 except Exception as _e:
-    tiktoklive_import_error = str(_e)
+    tiktoklive_import_error = (
+        f"{_e}. Please install with: pip install TikTokLive (note exact casing)"
+    )
 
 # Manage live listeners per "roomId" (we'll treat provided value as TikTok unique_id/username)
 tiktok_live_managers: Dict[str, Dict[str, Any]] = {}
