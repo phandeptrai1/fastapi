@@ -88,7 +88,7 @@ TIKTOKLIVE_AVAILABLE = False
 tiktoklive_import_error = None
 try:
     from TikTokLive import TikTokLiveClient
-    from TikTokLive.types.events import CommentEvent, ConnectEvent, DisconnectEvent
+    from tiktoklive.events import CommentEvent, ConnectEvent, DisconnectEvent
     TIKTOKLIVE_AVAILABLE = True
 except Exception as _e:
     tiktoklive_import_error = str(_e)
