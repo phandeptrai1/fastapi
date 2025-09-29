@@ -47,6 +47,23 @@ from bson import ObjectId, json_util
 from redis import asyncio as aioredis
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
+import inspect
+try:
+    import httpx  # Used by TikTokLive internally
+    # If current httpx.AsyncClient.__init__ does not support 'proxies', patch to ignore it
+    if 'proxies' not in inspect.signature(httpx.AsyncClient.__init__).parameters:
+        _OrigAsyncClient = httpx.AsyncClient
+
+        class _PatchedAsyncClient(_OrigAsyncClient):
+            def __init__(self, *args, **kwargs):
+                kwargs.pop('proxies', None)
+                super().__init__(*args, **kwargs)
+
+        httpx.AsyncClient = _PatchedAsyncClient  # type: ignore
+        logger.warning("Patched httpx.AsyncClient to ignore unsupported 'proxies' kwarg for compatibility")
+except Exception as _patch_err:
+    # Non-fatal; only affects TikTokLive path if used
+    logger.debug(f"httpx patch not applied: {_patch_err}")
 
 # Logging
 logging.basicConfig(level=logging.INFO)
