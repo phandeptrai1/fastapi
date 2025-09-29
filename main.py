@@ -83,6 +83,72 @@ MAX_WEBSOCKETS = 50
 active_sse_clients: Dict[str, list] = defaultdict(list)  # roomId -> list[asyncio.Queue]
 SSE_PING_INTERVAL = 15  # seconds
 
+# TikTokLive integration (optional)
+TIKTOKLIVE_AVAILABLE = False
+tiktoklive_import_error = None
+try:
+    from TikTokLive import TikTokLiveClient
+    from TikTokLive.types.events import CommentEvent, ConnectEvent, DisconnectEvent
+    TIKTOKLIVE_AVAILABLE = True
+except Exception as _e:
+    tiktoklive_import_error = str(_e)
+
+# Manage live listeners per "roomId" (we'll treat provided value as TikTok unique_id/username)
+tiktok_live_managers: Dict[str, Dict[str, Any]] = {}
+
+async def ensure_tiktok_listener(room_id: str):
+    """Ensure a TikTokLive listener is running for the given room_id (username).
+    When comments arrive, fan-out to SSE queues in active_sse_clients[room_id]."""
+    if not TIKTOKLIVE_AVAILABLE:
+        logger.warning(f"TikTokLive not available: {tiktoklive_import_error}")
+        return False
+    if not room_id:
+        return False
+    if room_id in tiktok_live_managers:
+        # Already running
+        return True
+
+    client = TikTokLiveClient(unique_id=room_id)
+
+    @client.on("connect")
+    async def on_connect(_: ConnectEvent):
+        logger.info(f"TikTokLive connected for room/user '{room_id}'")
+
+    @client.on("disconnect")
+    async def on_disconnect(_: DisconnectEvent):
+        logger.info(f"TikTokLive disconnected for room/user '{room_id}'")
+
+    @client.on("comment")
+    async def on_comment(event: CommentEvent):
+        try:
+            msg = {
+                "id": str(uuid.uuid4()),
+                "user": getattr(event.user, "nickname", "Viewer"),
+                "text": getattr(event, "comment", ""),
+                "timestamp": datetime.utcnow(),
+            }
+            for q in list(active_sse_clients.get(room_id, [])):
+                try:
+                    q.put_nowait(msg)
+                except Exception as e:
+                    logger.warning(f"SSE queue push failed: {e}")
+        except Exception as e:
+            logger.error(f"Error handling comment for {room_id}: {e}")
+
+    async def _runner():
+        try:
+            await client.start()
+        except Exception as e:
+            logger.error(f"TikTokLive client error for {room_id}: {e}")
+        finally:
+            # cleanup on exit
+            tiktok_live_managers.pop(room_id, None)
+
+    task = asyncio.create_task(_runner())
+    tiktok_live_managers[room_id] = {"client": client, "task": task}
+    logger.info(f"TikTokLive task started for '{room_id}'")
+    return True
+
 # Redis cache helper
 class EnhancedJSONEncoder(json.JSONEncoder):
     def default(self, o):
@@ -976,6 +1042,11 @@ async def tiktok_stream(roomId: str = Query(...)):
     queue: asyncio.Queue = asyncio.Queue()
     active_sse_clients[roomId].append(queue)
     logger.info(f"SSE connected: room {roomId}, clients={len(active_sse_clients[roomId])}")
+    # Ensure a TikTokLive listener is running for this room/user (if library available)
+    try:
+        await ensure_tiktok_listener(roomId)
+    except Exception as e:
+        logger.warning(f"ensure_tiktok_listener error for {roomId}: {e}")
 
     async def event_generator():
         try:
@@ -1009,7 +1080,15 @@ async def tiktok_stream(roomId: str = Query(...)):
         except Exception as e:
             logger.warning(f"SSE close cleanup error: {e}")
 
-    response = StreamingResponse(event_generator(), media_type="text/event-stream")
+    response = StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
     # Starlette's StreamingResponse doesn't have a first-class disconnect hook;
     # rely on generator finally plus GC; also keep reference to cleanup via background task
     response.background = None  # explicit
@@ -1047,6 +1126,41 @@ async def tiktok_mock_comment(body: TikTokMockComment):
         except Exception as e:
             logger.warning(f"Queue push failed: {e}")
     return {"delivered": len(queues), "message": msg}
+
+# Optional manual control endpoints
+class TikTokControl(BaseModel):
+    roomId: str
+
+@app.post("/tiktok/start")
+async def tiktok_start(ctrl: TikTokControl):
+    ok = await ensure_tiktok_listener(ctrl.roomId)
+    if not ok and not TIKTOKLIVE_AVAILABLE:
+        return {"status": "error", "detail": f"TikTokLive not available: {tiktoklive_import_error}"}
+    return {"status": "ok", "running": ctrl.roomId in tiktok_live_managers}
+
+async def stop_tiktok_listener(room_id: str):
+    mgr = tiktok_live_managers.get(room_id)
+    if not mgr:
+        return False
+    try:
+        client = mgr.get("client")
+        task: asyncio.Task = mgr.get("task")
+        if client:
+            # TikTokLive client exposes .stop() to disconnect
+            try:
+                await client.stop()
+            except Exception:
+                pass
+        if task and not task.done():
+            task.cancel()
+        return True
+    finally:
+        tiktok_live_managers.pop(room_id, None)
+
+@app.post("/tiktok/stop")
+async def tiktok_stop(ctrl: TikTokControl):
+    ok = await stop_tiktok_listener(ctrl.roomId)
+    return {"status": "ok" if ok else "not_running"}
 
 # ========== Karaoke APIs ==========
 @app.get("/api/songs", response_model=List[KaraokeSong])
