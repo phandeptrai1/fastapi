@@ -88,7 +88,12 @@ TIKTOKLIVE_AVAILABLE = False
 tiktoklive_import_error = None
 try:
     from TikTokLive import TikTokLiveClient
-    from tiktoklive.events import CommentEvent, ConnectEvent, DisconnectEvent
+    try:
+        # Official events path
+        from TikTokLive.types.events import CommentEvent, ConnectEvent, DisconnectEvent
+    except Exception:
+        # Some distros expose alternate path
+        from tiktoklive.events import CommentEvent, ConnectEvent, DisconnectEvent  # type: ignore
     TIKTOKLIVE_AVAILABLE = True
 except Exception as _e:
     tiktoklive_import_error = str(_e)
@@ -1038,6 +1043,9 @@ async def tiktok_stream(roomId: str = Query(...)):
     """
     if not roomId:
         raise HTTPException(status_code=400, detail="roomId required")
+    # Heuristic: warn if a numeric room id is provided instead of TikTok username
+    if roomId.isdigit():
+        logger.warning("TikTokLive expects unique_id (username). Provided numeric roomId; please use the TikTok username.")
 
     queue: asyncio.Queue = asyncio.Queue()
     active_sse_clients[roomId].append(queue)
