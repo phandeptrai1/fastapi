@@ -13,4 +13,3 @@ nltk
 scikit-learn
 joblib
 TikTokLive>=6.0.0
-
