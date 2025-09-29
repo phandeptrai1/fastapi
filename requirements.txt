@@ -12,4 +12,4 @@ numpy
 nltk
 scikit-learn
 joblib
-TikTokLive>=6.0.0
+TikTokLive==6.1.6
