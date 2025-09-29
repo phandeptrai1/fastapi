@@ -86,15 +86,29 @@ SSE_PING_INTERVAL = 15  # seconds
 # TikTokLive integration (optional)
 TIKTOKLIVE_AVAILABLE = False
 tiktoklive_import_error = None
+TIKTOKLIVE_EVENTS_PATH = None
 try:
     # IMPORTANT: Correct casing required both in install and import
     # pip install TikTokLive
     from TikTokLive import TikTokLiveClient
-    from TikTokLive.types.events import CommentEvent, ConnectEvent, DisconnectEvent
+    try:
+        from TikTokLive.types.events import CommentEvent, ConnectEvent, DisconnectEvent
+        TIKTOKLIVE_EVENTS_PATH = "TikTokLive.types.events"
+    except Exception:
+        try:
+            # Some releases expose events under TikTokLive.events
+            from TikTokLive.events import CommentEvent, ConnectEvent, DisconnectEvent  # type: ignore
+            TIKTOKLIVE_EVENTS_PATH = "TikTokLive.events"
+        except Exception:
+            # Older/alt package exposes tiktoklive.events (lowercase)
+            from tiktoklive.events import CommentEvent, ConnectEvent, DisconnectEvent  # type: ignore
+            TIKTOKLIVE_EVENTS_PATH = "tiktoklive.events"
     TIKTOKLIVE_AVAILABLE = True
+    logger.info(f"TikTokLive available, events from: {TIKTOKLIVE_EVENTS_PATH}")
 except Exception as _e:
     tiktoklive_import_error = (
-        f"{_e}. Please install with: pip install TikTokLive (note exact casing)"
+        f"{_e}. Please install with: pip install TikTokLive (note exact casing). "
+        "If the error persists, ensure your runtime has access to the package."
     )
 
 # Manage live listeners per "roomId" (we'll treat provided value as TikTok unique_id/username)
@@ -1073,7 +1087,7 @@ async def tiktok_stream(roomId: str = Query(...)):
                     # loop to send ping periodically
                     continue
         except asyncio.CancelledError:
-            logger.info("SSE generator cancelled")
+            logger.debug("SSE generator cancelled")
         finally:
             # cleanup happens in response.close but keep here for safety
             pass
